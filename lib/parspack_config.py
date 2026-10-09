@@ -1256,6 +1256,20 @@ def classify_transport_error(text):
     return "RETRYABLE"
 
 
+def retry_delay_argv(args):
+    """Delay from three decimal arguments. Never reads stdin or tool stdout.
+
+    A leading -- is only a separator. Extra tokens, including a stray "ok"
+    from mc, are rejected instead of being parsed as the delay.
+    """
+    values = list(args)
+    if values[:1] == ["--"]:
+        values = values[1:]
+    if len(values) != 3 or any(re.fullmatch(r"[0-9]{1,6}", item) is None for item in values):
+        raise ConfigError("usage: retry-delay ATTEMPT BASE CAP")
+    return retry_backoff_seconds(int(values[0]), int(values[1]), int(values[2]))
+
+
 def retry_backoff_seconds(attempt, base, cap):
     """Exponential delay. attempt is 1 on the first failure. Base 0 stays 0."""
     attempt = int(attempt)
@@ -1952,9 +1966,8 @@ def dispatch(argv):
             return 1
         return 0
     if command == "retry-delay":
-        if len(args) != 3:
-            raise ConfigError("usage: retry-delay ATTEMPT BASE CAP")
-        sys.stdout.write(str(retry_backoff_seconds(args[0], args[1], args[2])) + "\n")
+        # argv only. stdin is left unread so a piped mc "ok" cannot change the delay.
+        sys.stdout.write(str(retry_delay_argv(args)) + "\n")
         return 0
     if command == "self-test":
         return self_test()
@@ -1994,6 +2007,27 @@ def self_test():
     assert classify_transport_error("503 Service Unavailable") == "RETRYABLE"
     assert classify_transport_error("temporary failure in name resolution") == "RETRYABLE"
     assert classify_transport_error("unexpected EOF") == "RETRYABLE"
+    assert retry_delay_argv(["--", "1", "0", "300"]) == 0
+    assert retry_delay_argv(["2", "0", "300"]) == 0
+    expect_error(lambda: retry_delay_argv(["--", "1", "ok", "300"]))
+    expect_error(lambda: retry_delay_argv(["ok"]))
+    expect_error(lambda: retry_delay_argv(["--", "1", "0", "300", "ok"]))
+    noisy = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "retry-delay", "--", "1", "0", "300"],
+        input=b"ok\nok\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert noisy.returncode == 0 and noisy.stdout.strip() == b"0", noisy.stderr
+    poisoned = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "retry-delay", "--", "1", "ok", "300"],
+        input=b"1 0 300\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert poisoned.returncode != 0 and b"usage: retry-delay" in poisoned.stderr
     assert retry_backoff_seconds(1, 0, 300) == 0
     assert 24 <= retry_backoff_seconds(1, 30, 300) <= 30
     assert retry_backoff_seconds(4, 30, 40) <= 40

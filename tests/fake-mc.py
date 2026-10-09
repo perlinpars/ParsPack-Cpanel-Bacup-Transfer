@@ -39,7 +39,7 @@ while index < len(rest):
     item = rest[index]
     if item == "--":
         after_dd = True
-    elif not after_dd and item in ("--parallel", "--part-size"):
+    elif not after_dd and item in ("--parallel", "--part-size", "--checksum"):
         index += 1
     elif not after_dd and item.startswith("--"):
         flags.append(item)
@@ -92,10 +92,42 @@ def entry(path, name):
     return describe_file(path, name)
 
 
+def note_noise(kind):
+    # Opt-in only. A normal put or stat must not print "ok" on either stream.
+    if os.environ.get("FAKE_MC_NOISE") == "1" and kind == "put":
+        sys.stdout.write("ok\n")
+
+
+def forced_put_failure():
+    raw = os.environ.get("FAKE_MC_FAIL_PUTS", "")
+    if not raw.isdigit() or int(raw) <= 0:
+        return False
+    counter = os.path.join(store, ".fail-puts")
+    used = 0
+    if os.path.isfile(counter):
+        try:
+            used = int(open(counter, "r", encoding="utf-8").read().strip() or "0")
+        except ValueError:
+            used = 0
+    if used >= int(raw):
+        return False
+    with open(counter, "w", encoding="utf-8") as handle:
+        handle.write("%d\n" % (used + 1))
+    sys.stderr.write("fake-mc: forced put failure\n")
+    return True
+
+
 if command == "put":
+    if len(positional) != 2:
+        sys.stderr.write("fake-mc: put expects two paths\n")
+        sys.exit(2)
+    note_noise("put")
+    if forced_put_failure():
+        sys.exit(1)
     destination = location(positional[1])
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     shutil.copyfile(positional[0], destination)
+    sys.exit(0)
 elif command == "cp":
     source_name, dest_name = positional[0], positional[1]
     if dest_name.startswith("/") or (len(dest_name) > 2 and dest_name[1] == ":"):
@@ -115,6 +147,7 @@ elif command == "stat":
     if not os.path.isfile(path):
         missing()
     sys.stdout.write(json.dumps(describe_file(path, os.path.basename(path))) + "\n")
+    sys.exit(0)
 elif command == "ls":
     target = positional[0]
     path = location(target)

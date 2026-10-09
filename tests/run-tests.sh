@@ -127,6 +127,17 @@ expect 2 "bad MODE refused" "$P/bin/parspackctl" doctor
 conf
 
 echo "== engine"
+export FAKE_MC_NOISE=1 FAKE_MC_FAIL_PUTS=1
+echo "noisy-retry" > "$B/noisy.tar.gz"
+chmod 644 "$B/noisy.tar.gz"
+expect 0 "noisy mc stdout cannot corrupt retry" "$E" "$B/noisy.tar.gz" "noisy.tar.gz"
+if grep -q "Retrying after" "$P/logs/backup.log" && ! grep -q "usage: retry-delay" "$P/logs/backup.log" && [[ -f "$FAKE_STORE/mybucket/cpanel/noisy.tar.gz" ]]; then
+  ok "retry delay ignored noisy mc stdout"
+else
+  bad "retry delay was corrupted by mc stdout"
+fi
+unset FAKE_MC_NOISE FAKE_MC_FAIL_PUTS
+rm -f "$FAKE_STORE/.fail-puts"
 conf MODE=TEST
 expect 3 "TEST mode uploads nothing and exits 3" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
 [[ -z "$(find "$FAKE_STORE" -type f -print -quit)" ]] && ok "TEST mode stored nothing" || bad "TEST mode stored data"
