@@ -18,7 +18,6 @@ import random
 import re
 import shlex
 import shutil
-import ssl
 import stat
 import subprocess
 import sys
@@ -1711,7 +1710,7 @@ def doctor():
             print(line)
             if failed:
                 failures.append(line)
-    except parspack_config.ConfigError:
+    except ConfigError:
         raise
     except Exception:
         failures.append("remote probe failed")

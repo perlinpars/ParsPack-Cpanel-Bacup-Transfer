@@ -11,6 +11,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.realpath(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -616,9 +617,7 @@ def connection_checks(conf, mc=None, version=None, resolve=None, tls=None, now=N
 
 
 def tempfile_probe(directory):
-    import tempfile
     handle = tempfile.NamedTemporaryFile(dir=directory, prefix="probe-", suffix=".txt", delete=False)
-    fd = handle.fileno()
     name = handle.name
     handle.close()
     return os.open(name, os.O_WRONLY), name

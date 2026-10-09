@@ -454,7 +454,7 @@ classify_remote() {
       return 0
       ;;
     "ok size-only")
-      VERIFY_LEVEL=size-only
+      VERIFY_LEVEL="size-only"
       VERIFY_SUM=""
       printf '%s\n' match
       return 0

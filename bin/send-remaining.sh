@@ -119,7 +119,7 @@ if [[ -z "$DAY" ]]; then
   if [[ -n "$first_pending" ]]; then
     note_incomplete "$first_pending"
   fi
-  write_status done "فایل مانده‌ای برای ارسال پیدا نشد"
+  write_status "done" "فایل مانده‌ای برای ارسال پیدا نشد"
   exit 0
 fi
 
@@ -173,5 +173,5 @@ if [[ -f "$marker" && ! -L "$marker" ]]; then
     note_incomplete "$DAY"
   fi
 fi
-write_status done "ارسال $DAY تمام شد. موفق: $SENT، ناموفق: $FAILED، رد شده: $SKIPPED"
+write_status "done" "ارسال $DAY تمام شد. موفق: $SENT، ناموفق: $FAILED، رد شده: $SKIPPED"
 exit 0
