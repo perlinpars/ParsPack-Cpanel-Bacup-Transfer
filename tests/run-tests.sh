@@ -12,7 +12,12 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PARENT="/var/tmp"
 [[ -d "$PARENT" && -w "$PARENT" ]] || PARENT="/tmp"
 T="$(mktemp -d "$PARENT/parspack-test.XXXXXX")"
-trap 'rm -rf "$T"' EXIT
+cleanup() {
+  local status=$?
+  rm -rf "$T"
+  exit "$status"
+}
+trap cleanup EXIT
 chmod 700 "$T"
 P="$T/proj"
 mkdir -p "$P"
@@ -32,7 +37,7 @@ chmod 700 "$P/lib" "$P/bin" "$P/config" "$P/transport" "$P/tests"
 
 B="$T/local"
 mkdir -p "$B"
-chmod 755 "$B"
+chmod 700 "$B"
 echo "backup-data-1234" > "$B/u.tar.gz"
 chmod 644 "$B/u.tar.gz"
 
@@ -46,17 +51,28 @@ FAIL_N=0
 
 ok() { PASS_N=$((PASS_N + 1)); echo "  ok   - $1"; }
 bad() { FAIL_N=$((FAIL_N + 1)); echo "  FAIL - $1"; }
+# Expected failures must not abort the suite. set -e stays off for every check.
 expect() {
-  local want="$1" name="$2"
+  local want="$1" name="$2" rc
   shift 2
+  set +e
   "$@" >"$T/out" 2>&1
-  local rc=$?
+  rc=$?
+  set +e
   if [[ "$rc" == "$want" ]]; then
     ok "$name"
   else
     bad "$name (rc=$rc want $want)"
     sed 's/^/        /' "$T/out" | head -8
   fi
+  return 0
+}
+run_to() {
+  set +e
+  "$@" >"$T/out" 2>&1
+  RUN_RC=$?
+  set +e
+  return 0
 }
 
 conf() {
@@ -101,6 +117,7 @@ E="$P/bin/engine-upload.sh"
 R="$P/bin/remote-ops.sh"
 conf
 
+set +e
 echo "== config / doctor"
 python3 "$P/lib/parspack_config.py" self-test >"$T/out" 2>&1
 if [[ "$(tail -n 1 "$T/out")" == "OK" ]]; then ok "python self-test"; else bad "python self-test"; sed 's/^/        /' "$T/out" | head -8; fi
@@ -186,22 +203,15 @@ else
 fi
 
 echo "== remote operations"
-set +e
-"$R" delete "2026-09-28/u.tar.gz" >"$T/out" 2>&1
-del_rc=$?
-set -e
-[[ "$del_rc" -eq 1 ]] && grep -F -q "refused: remote delete disabled" "$T/out" && ok "delete refused: remote delete disabled" || bad "delete refusal message was wrong (rc=$del_rc)"
+run_to "$R" delete "2026-09-28/u.tar.gz"
+[[ "$RUN_RC" -eq 1 ]] && grep -F -q "refused: remote delete disabled" "$T/out" && ok "delete refused: remote delete disabled" || bad "delete refusal message was wrong (rc=$RUN_RC)"
 mkdir -p "$FAKE_STORE/mybucket/cpanel"
 echo x > "$FAKE_STORE/mybucket/cpanel/validate.tmp-1-2.txt"
 expect 0 "validation object can be deleted" "$R" delete-validation "validate.tmp-1-2.txt"
 expect 1 "validation delete refuses a backup name" "$R" delete-validation "2026-09-28/u.tar.gz"
 conf MODE=TEST
-set +e
-"$R" rmdir "2026-09-28" >"$T/out" 2>&1
-rmdir_rc=$?
-set -e
-[[ "$rmdir_rc" -eq 1 ]] && grep -F -q "refused: remote delete disabled" "$T/out" && ok "TEST rmdir refused: remote delete disabled" || bad "TEST rmdir message was wrong (rc=$rmdir_rc)"
-set +e
+run_to "$R" rmdir "2026-09-28"
+[[ "$RUN_RC" -eq 1 ]] && grep -F -q "refused: remote delete disabled" "$T/out" && ok "TEST rmdir refused: remote delete disabled" || bad "TEST rmdir message was wrong (rc=$RUN_RC)"
 conf
 conf ALLOW_REMOTE_DELETE=1
 expect 1 "rmdir / refused" "$R" rmdir /
@@ -238,10 +248,15 @@ conf
 expect 0 "mkdir" "$R" mkdir "2026-10-01/accounts"
 [[ -f "$FAKE_STORE/mybucket/cpanel/2026-10-01/accounts/.keep" ]] && ok "mkdir creates a .keep object" || bad "mkdir did not create .keep"
 echo z > "$FAKE_STORE/mybucket/cpanel/2026-10-01/accounts/a.tar.gz"
+set +e
 ls_out="$("$R" ls "2026-10-01/accounts" 2>/dev/null)"
-[[ "$ls_out" == *a.tar.gz* && "$ls_out" != *.keep* ]] && ok "ls lists the object and hides .keep" || bad "ls output: $ls_out"
+ls_rc=$?
+set +e
+[[ "$ls_rc" -eq 0 && "$ls_out" == *a.tar.gz* && "$ls_out" != *.keep* ]] && ok "ls lists the object and hides .keep" || bad "ls output: $ls_out"
+set +e
 missing_out="$("$R" ls "2099-01-01/missing" 2>"$T/ls.err")"
 missing_rc=$?
+set +e
 [[ "$missing_rc" -eq 0 && -z "$missing_out" ]] && ok "ls of a missing directory exits 0 with no output" || bad "ls missing rc=$missing_rc out=$missing_out"
 expect 0 "get" "$R" get "2026-10-01/accounts/a.tar.gz" "$B/got.tar.gz"
 [[ "$(cat "$B/got.tar.gz")" == "z" ]] && ok "get wrote the object" || bad "get contents were wrong"
@@ -265,4 +280,7 @@ grep -q 'exit 3' "$P/bin/engine-upload.sh" && ok "TEST mode put still exits 3" |
 
 echo
 echo "passed=$PASS_N failed=$FAIL_N"
-[[ "$FAIL_N" == 0 ]]
+if [[ "$FAIL_N" -ne 0 ]]; then
+  exit 1
+fi
+exit 0
