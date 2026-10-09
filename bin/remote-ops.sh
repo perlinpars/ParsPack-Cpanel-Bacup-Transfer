@@ -90,11 +90,29 @@ case "$cmd" in
       pp_die "Downloaded object could not be checked; the partial file was removed"
     fi
     fields="$(printf '%s\n' "$stat_json" | pp_py stat-fields -- "$src")"
+    # stat-fields is size, sha256, etag. The etag must not be glued onto the hash.
     remote_size="${fields%%$'\t'*}"
-    remote_sha="${fields#*$'\t'}"
+    rest="${fields#*$'\t'}"
+    remote_sha="${rest%%$'\t'*}"
+    remote_etag=""
+    if [[ "$rest" == *$'\t'* ]]; then
+      remote_etag="${rest#*$'\t'}"
+    fi
     if [[ "$got_size" != "$remote_size" || ! "$got_sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
       cleanup_partial
       pp_die "Downloaded file does not match the remote size; the destination was left unchanged"
+    fi
+    if [[ "$remote_sha" == "-" && -n "$remote_etag" ]]; then
+      integrity="$(pp_py verify-decision --local-size "$got_size" --remote-size "$remote_size" --local-sha "$got_sha" --remote-sha "-" --etag "$remote_etag" --part-size "$PART_SIZE" --file "$partial")"
+      case "$integrity" in
+        "ok etag")
+          remote_sha="$got_sha"
+          ;;
+        mismatch)
+          cleanup_partial
+          pp_die "Downloaded file checksum does not match the remote object; the destination was left unchanged"
+          ;;
+      esac
     fi
     if [[ "$remote_sha" == "-" ]]; then
       result="$(pp_mktemp)"

@@ -83,6 +83,8 @@ def describe_file(path, name):
         payload["etag"] = hashlib.md5(raw).hexdigest()
     else:
         payload["checksum"] = {"SHA256": encoded}
+        if mode == "sha-and-etag":
+            payload["etag"] = hashlib.md5(raw).hexdigest()
     return payload
 
 

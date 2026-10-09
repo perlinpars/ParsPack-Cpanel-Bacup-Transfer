@@ -234,6 +234,18 @@ missing_rc=$?
 [[ "$missing_rc" -eq 0 && -z "$missing_out" ]] && ok "ls of a missing directory exits 0 with no output" || bad "ls missing rc=$missing_rc out=$missing_out"
 expect 0 "get" "$R" get "2026-10-01/accounts/a.tar.gz" "$B/got.tar.gz"
 [[ "$(cat "$B/got.tar.gz")" == "z" ]] && ok "get wrote the object" || bad "get contents were wrong"
+export FAKE_MC_MODE=sha-and-etag
+rm -f "$B/got-etag.tar.gz"
+expect 0 "get with etag present" "$R" get "2026-10-01/accounts/a.tar.gz" "$B/got-etag.tar.gz"
+[[ "$(cat "$B/got-etag.tar.gz")" == "z" ]] && ok "get with etag wrote the object" || bad "get with etag contents were wrong"
+export FAKE_MC_MODE=mismatch
+rm -f "$B/got-bad.tar.gz" "$B/got-bad.tar.gz.parspack-partial"
+expect 1 "get with checksum mismatch" "$R" get "2026-10-01/accounts/a.tar.gz" "$B/got-bad.tar.gz"
+[[ ! -e "$B/got-bad.tar.gz" && ! -e "$B/got-bad.tar.gz.parspack-partial" ]] && ok "checksum mismatch left no local file" || bad "checksum mismatch left a local file"
+unset FAKE_MC_MODE
+rm -f "$B/got-missing.tar.gz" "$B/got-missing.tar.gz.parspack-partial"
+expect 1 "get when the object is missing" "$R" get "2099-01-01/no-such-object.tar.gz" "$B/got-missing.tar.gz"
+[[ ! -e "$B/got-missing.tar.gz" && ! -e "$B/got-missing.tar.gz.parspack-partial" ]] && ok "missing object left no local file" || bad "missing object left a local file"
 canon="$("$P/lib/parspack_config.py" check-local read --cwd "$B" -- u.tar.gz)"
 [[ "$canon" == "$B/u.tar.gz" ]] && ok "relative local path uses the cPanel directory" || bad "relative path resolved to $canon"
 grep -q 'my ($local_file, $dest_file) = @args\[0, 1\];' "$P/transport/parspack_transport.pl" && ok "put follows the Perl skeleton argument order" || bad "put argument order changed"
