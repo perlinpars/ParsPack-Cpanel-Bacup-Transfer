@@ -7,6 +7,11 @@ import subprocess
 import sys
 import tempfile
 
+try:
+    import pwd
+except ImportError:
+    pwd = None
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import parspack_ops  # noqa: E402
@@ -88,7 +93,7 @@ def arguments():
         fail("a backup object matched the probe target")
 
 
-def not_root():
+def _reject_non_root():
     bad = ""
     held = sys.stderr
     sys.stderr = open(os.devnull, "w")
@@ -108,6 +113,65 @@ def not_root():
         sys.stderr = held
     if bad:
         fail("command was not rejected for a non-root caller: %s" % bad)
+
+
+def not_root():
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        _reject_non_root()
+        return
+    if pwd is None:
+        print("skip not_root: euid is 0 and pwd is unavailable", file=sys.stderr)
+        return
+    try:
+        account = pwd.getpwnam("nobody")
+    except KeyError:
+        print("skip not_root: euid is 0 and user nobody is unavailable", file=sys.stderr)
+        return
+    readable = tempfile.mkdtemp(prefix="parspack-noroot-")
+    os.chmod(readable, 0o755)
+    lib = os.path.join(readable, "lib")
+    os.mkdir(lib, 0o755)
+    for name in os.listdir(os.path.join(ROOT, "lib")):
+        if not name.endswith(".py"):
+            continue
+        dest = os.path.join(lib, name)
+        shutil.copy(os.path.join(ROOT, "lib", name), dest)
+        os.chmod(dest, 0o644)
+    script = (
+        "import os, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "if os.geteuid() == 0:\n"
+        "    sys.stderr.write('still root\\n')\n"
+        "    sys.exit(1)\n"
+        "import parspack_ops\n"
+        "bad = ''\n"
+        "for argv in (['retry', '--failed'], ['verify', %r], ['status'], ['connection-test'], ['nope']):\n"
+        "    if parspack_ops.main(argv) != 2:\n"
+        "        bad = ' '.join(argv)\n"
+        "        break\n"
+        "if bad:\n"
+        "    sys.stderr.write(bad + '\\n')\n"
+        "    sys.exit(1)\n"
+    ) % (lib, DATE)
+
+    def drop():
+        os.setgroups([])
+        os.setgid(account.pw_gid)
+        os.setuid(account.pw_uid)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            preexec_fn=drop,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    finally:
+        shutil.rmtree(readable, ignore_errors=True)
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        fail("command was not rejected for a non-root caller: %s" % detail)
 
 
 def conf(directory):
