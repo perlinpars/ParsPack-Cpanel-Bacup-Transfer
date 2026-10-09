@@ -2,8 +2,9 @@
 use strict;
 use warnings;
 use Fcntl qw(O_WRONLY O_APPEND O_CREAT O_NOFOLLOW O_EXCL F_GETFD F_SETFD FD_CLOEXEC);
+use IO::Handle;
 use IO::Select;
-use POSIX qw(strftime setsid fsync);
+use POSIX qw(strftime setsid);
 
 # Capture the destination password, then drop the inherited environment.
 # PARSPACK_TEST_ROOT is only honored for a non-root test run. cPanel runs this as root.
@@ -148,9 +149,23 @@ sub write_system_pending {
     return 0 if -l $final;
     my $tmp = "$dir/.system-pending-$date.$$.tmp";
     sysopen(my $fh, $tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or return 0;
-    my $ok = print $fh "date=$date\n";
-    $ok &&= fsync(fileno($fh));
-    $ok &&= close $fh;
+    my $ok = print $fh "date=$date\n" ? 1 : 0;
+    # flush and sync return numeric 0 on success. The POD calls that
+    # "0 but true". -1 and undef are failures, so a boolean check is wrong.
+    # The state directory is not synced: this process never opens it.
+    if ($ok) {
+        my $flushed = $fh->flush;
+        $ok = defined $flushed && $flushed == 0;
+    }
+    if ($ok) {
+        my $synced = $fh->sync;
+        if (!defined $synced || $synced != 0) {
+            $ok = 0;
+        }
+    }
+    if (!close $fh) {
+        $ok = 0;
+    }
     if (!$ok) {
         unlink $tmp;
         return 0;
