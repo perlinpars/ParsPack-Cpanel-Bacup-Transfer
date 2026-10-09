@@ -1,0 +1,2 @@
+# Install only after end-to-end tests pass.
+# 10 2 * * * root /root/parspack-backup/bin/report.py >> /root/parspack-backup/logs/report.log 2>&1

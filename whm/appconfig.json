@@ -1,0 +1,12 @@
+{
+  "name": "parspack_backup",
+  "displayname": "PARSPACK Backup",
+  "service": "whostmgr",
+  "acls": ["all"],
+  "entryurl": "parspack_backup/index.php",
+  "url": "parspack_backup/index.php",
+  "target": "parspack_backup",
+  "icon": "parspack_backup.png",
+  "searchtext": "PARSPACK Backup S3 Object Storage",
+  "vendor": "PARSPACK"
+}

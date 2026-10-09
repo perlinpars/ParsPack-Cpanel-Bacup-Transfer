@@ -1,0 +1,11 @@
+config/parspack.conf
+mc-config/
+__pycache__/
+*.pyc
+logs/
+state/
+reports/
+tmp/
+run/
+tests/fake-env
+.parspack-test.*/

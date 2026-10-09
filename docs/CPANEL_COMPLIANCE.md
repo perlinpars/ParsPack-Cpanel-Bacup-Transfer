@@ -1,0 +1,49 @@
+# cPanel transport compliance
+
+Source: [How to Create a Custom Transport Script for Backups](https://docs.cpanel.net/knowledge-base/backup/how-to-create-a-custom-transport-script-for-backups/), last modified 2026-07-08. Argument order follows that page’s skeleton and “Required argument order” section. The summary table on the same page lists `put` and `get` parameters in a different order. See `docs/DECISIONS.md`.
+
+Invocation shape from “Script operation”:
+
+1. Command name.
+2. Current directory.
+3. Command-specific parameters.
+4. Host.
+5. Username.
+
+Password arrives in `PASSWORD`. Each command is a new process. State must not be stored between commands. Output data goes to STDOUT. Failures go to STDERR and are logged by cPanel.
+
+There is no official `describe` or `validate` command. WHM’s Validate action uses the commands below. This plugin treats a remote name matching `validate.tmp-<digits>-<digits>.txt` as that probe.
+
+The transport page does not publish a numeric exit-code table. The skeleton exits `1` for usage errors. Any non-zero status is treated below as failure. The pruning page separately says a transport process is limited to 300 seconds: [How to Troubleshoot a Remote Transport Pruning Failure](https://docs.cpanel.net/knowledge-base/backup/how-to-troubleshoot-a-remote-transport-pruning-failure/).
+
+| Command | Documented contract | This plugin | Deviation |
+| --- | --- | --- | --- |
+| `put` | Copy one local file to the remote file. Skeleton args: local file, remote file, host, user. Errors on STDERR. | Resolves the local path, refuses symlinks and paths outside `LOCAL_READ_ROOTS`, uploads through `engine-upload.sh`, verifies size and checksum, then returns the engine status. On success for an account archive, writes `state/system-pending-YYYY-MM-DD` and detaches the system mirror. It does not wait for `system/`. | If the marker cannot be written, `put` exits 1 even though the account object is already verified. If detach fails, `put` still exits 0 and the marker stays. `MODE=TEST` returns exit `3` and uploads nothing. A young file can block inside this process for up to 5 times 60 seconds, plus upload retries. |
+| `get` | Copy remote file to local file. Skeleton args: remote, local, host, user. | Downloads to a sibling partial file, checks size and checksum, then renames into place. | Stricter than the sample. A missing checksum downloads the object a second time to hash it. |
+| `ls` | Print `ls -l` compatible text on STDOUT. | Lists one prefix with `mc ls --json` and formats it. A missing directory prints nothing and exits 0. `.keep` markers are hidden. | A missing path does not return the non-zero status a local `ls` would. |
+| `mkdir` | Create the remote directory. Skeleton also receives a recurse flag. | Creates `<path>/.keep` so the prefix exists. An empty path or `/` exits 0. | The recurse flag is not read. `.keep` is an extra object. |
+| `chdir` | Succeed only if the directory can be used, then print the directory the next command will receive as its local directory. | Checks the path is a legal key and prints the composed remote directory. | It does not create the directory. A later `ls` of a missing directory is empty rather than an error. |
+| `rmdir` | Recursively delete that directory. Never delete `/`. | Requires `ALLOW_REMOTE_DELETE=1` and `MODE=PRODUCTION`. The path must be `<prefix>/<YYYY-MM-DD>/...`. Refuses an empty prefix, the bucket root, `..`, a non-date name, today’s folder, and the newest verified day. A failed listing is a refusal. Then `mc rm --recursive` on that one directory. | With the default flag, cPanel pruning fails and nothing is deleted. |
+| `delete` | Delete one remote file. | Validation names are deleted even when remote delete is off. Every other name uses the same date-folder guard as `rmdir` and must name a file under that day. | Default configuration rejects the retention deletes cPanel will send. The validation exception is intentional so WHM Validate can remove its probe. |
+
+## Retention when remote delete is off
+
+[Backup Retention Behavior](https://docs.cpanel.net/knowledge-base/backup/backup-retention-behavior/) describes how many successful and failed backups cPanel keeps. It does not list the transport argv. The only delete operations in the transport interface are `delete` and `rmdir`, and the pruning article describes remote pruning as work done by the transport, with a 300 second limit per process.
+
+With `ALLOW_REMOTE_DELETE=0`:
+
+- `rmdir` exits 1 and writes `refused: remote delete disabled` to STDERR.
+- `delete` of a backup object does the same.
+- `delete` of `validate.tmp-<digits>-<digits>.txt` still removes that one object.
+
+Result: cPanel’s remote retention cannot prune this destination while the flag is `0`. Objects remain. That is not silent data loss. The bucket can fill. Setting the flag to `1` still refuses any path that is not inside `<prefix>/<YYYY-MM-DD>/`, and it refuses today’s folder and the newest verified day.
+
+Local retention is separate. [Backup Configuration](https://docs.cpanel.net/whm/backup/backup-configuration/) says that if “Retain Backups in the Default Backup Directory” is off, cPanel deletes account backup files from the local backup directory only after a successful transfer to at least one additional destination and an attempt to every destination. That setting does not remove system backup files. This plugin can also delete a local file after the remote object is verified, then checked again for size, when `DELETE_LOCAL_AFTER_SUCCESS=1`. `DELETE_LOCAL_DELAY` is `0`, `10m`, `1h`, or `manual`. A failed local delete is `LOCAL_CLEANUP_FAILED` and the `put` still exits 0.
+
+cPanel does not send the plugin the list of accounts for the run. The expected set is the regular `accounts/*.tar.gz` files in the local date directory, excluding `validate.tmp-*`. The detached system mirror, not `put`, waits until each of those accounts is terminal or until `SYSTEM_DEADLINE_SECONDS`. `put` still only writes the pending marker and detaches.
+
+## Not specified by the transport page
+
+- No per-command timeout other than the 300 second pruning note.
+- No required behavior when two backup runs overlap.
+- No requirement to upload `system/` from a custom transport. cPanel uploads system files to an additional destination only when that destination’s system-backup option is enabled, and that path is one archive. This plugin uploads the existing local `system/` tree itself so the internal folders stay intact.

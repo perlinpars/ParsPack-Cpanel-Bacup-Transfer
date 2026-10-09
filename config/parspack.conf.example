@@ -1,0 +1,105 @@
+# PARSPACK Backup configuration
+# Copy to config/parspack.conf and keep it mode 600, owned by root.
+# Quoted values may be followed by a comment. Do not put spaces, quotes,
+# or backslashes inside secrets.
+
+# TEST uploads nothing and the engine exits 3, so cPanel does not treat a dry
+# run as a stored backup and delete the local file. PRODUCTION uploads for real.
+MODE="TEST"                         # TEST | PRODUCTION
+
+# Required. The URL must be https and must not contain credentials.
+PARSPACK_ENDPOINT="https://s3.example.invalid"
+PARSPACK_ACCESS_KEY="CHANGE_ME"
+PARSPACK_SECRET_KEY="CHANGE_ME"
+PARSPACK_BUCKET="CHANGE_ME"
+
+# Applied to put, get, ls, mkdir, chdir, delete, and rmdir.
+# In WHM, set the remote directory to the path under this prefix.
+PARSPACK_PREFIX="cpanel"
+
+# Same value as the password of the WHM custom backup destination.
+# At least 12 characters, and different from the S3 keys.
+TRANSPORT_PASSWORD="CHANGE_ME"
+TRANSPORT_AUTH_DISABLED="0"        # 1 disables the WHM password check. Leave this at 0.
+TRANSPORT_TRACE="0"                 # 1 writes logs/transport-trace.log. The password is not recorded.
+
+MC_BIN="/usr/local/bin/mc"
+MC_CONFIG_DIR="/root/parspack-backup/mc-config"
+MC_ALIAS="parspack"
+
+# Multipart
+PART_SIZE="256MiB"
+PARALLEL_PARTS="4"
+
+# Reliability
+# RETRY_COUNT is the limit for one file: the size watch and the upload command
+# each stop after this many tries. A later pass does not keep going forever.
+RETRY_COUNT="5"
+RETRY_DELAY_SECONDS="30"
+# Upper bound for the exponential retry delay. 0 means no cap.
+RETRY_DELAY_CAP_SECONDS="300"
+# cPanel hands the file over immediately, so this age is not a hard refusal.
+# A younger file is uploaded after its size and mtime stay unchanged.
+MIN_FILE_AGE_MINUTES="15"
+STABILITY_CHECK_SECONDS="60"
+# How long one upload waits for another upload to finish one file.
+# Kept below cPanel's 300 second transport limit.
+UPLOAD_LOCK_WAIT_SECONDS="120"
+
+# VERIFY: keep the remote object when size and sha256 match; otherwise stop.
+# SKIP: same as VERIFY, and a same-size object with no checksum is left as-is.
+# REPLACE: overwrite, and only when MODE=PRODUCTION.
+REMOTE_EXISTS_POLICY="VERIFY"
+
+# PRODUCTION only. TEST never uploads, so these switches are not used in a dry run.
+# Give the S3 key DeleteObject only when remote delete is required.
+# DELETE_LOCAL_DELAY: 0 deletes after a fresh size check, 10m or 1h waits,
+# manual never deletes automatically.
+DELETE_LOCAL_AFTER_SUCCESS="0"
+DELETE_LOCAL_DELAY="0"
+# How long the account-name set must stay unchanged, and the overall wait,
+# before the detached system mirror starts or reports the day as partial.
+SYSTEM_SET_STABLE_SECONDS="120"
+SYSTEM_DEADLINE_SECONDS="21600"
+# 0 refuses cPanel's delete and rmdir. 1 allows them only for a YYYY-MM-DD
+# folder under PARSPACK_PREFIX, and still refuses today and the newest
+# verified day. There is no separate retention cron.
+ALLOW_REMOTE_DELETE="0"
+
+# These directories must stay inside /root/parspack-backup.
+LOG_DIR="/root/parspack-backup/logs"
+STATE_DIR="/root/parspack-backup/state"
+REPORT_DIR="/root/parspack-backup/reports"
+
+# Colon-separated absolute directories. Each directory, and every parent
+# from the backup file up to that directory, must be owned by root and must
+# not be writable by group or others. /tmp is not a safe default.
+LOCAL_READ_ROOTS="/backup:/var/cpanel"
+LOCAL_WRITE_ROOTS="/backup:/var/cpanel"
+
+# SMTP reporting. Cleartext is refused; leave this disabled until TLS works.
+# NOTIFY_ON_SUCCESS and NOTIFY_ON_FAILURE choose which results are emailed.
+# Both default to on. A warning still counts as a successful transfer.
+SMTP_ENABLED="0"
+SMTP_HOST=""
+SMTP_PORT="587"
+SMTP_USER=""
+SMTP_PASSWORD=""
+REPORT_FROM=""
+REPORT_TO=""
+SMTP_TLS="1"
+NOTIFY_ON_SUCCESS="1"
+NOTIFY_ON_FAILURE="1"
+
+# Optional alerts. 0 disables the recorded-usage warning. Channels stay off
+# until the matching *_ENABLED value is 1. URLs must be https with no userinfo.
+# Leave secret values empty here; set them only in the private config file.
+ALERT_REMOTE_BYTES="0"
+WEBHOOK_ENABLED="0"
+WEBHOOK_URL=""
+WEBHOOK_SECRET=""
+TELEGRAM_ENABLED="0"
+TELEGRAM_CHAT=""
+TELEGRAM_BOT_TOKEN=""
+SLACK_ENABLED="0"
+SLACK_WEBHOOK_URL=""
