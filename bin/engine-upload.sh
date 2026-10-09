@@ -473,6 +473,7 @@ classify_remote() {
     return 0
   fi
   if [[ "$remote_content_sha" == "$local_sha" ]]; then
+    pp_log INFO "Remote object content SHA256 verified: $local_sha"
     VERIFY_LEVEL=sha256
     VERIFY_SUM="$local_sha"
     printf '%s\n' match

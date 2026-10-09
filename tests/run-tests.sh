@@ -144,21 +144,23 @@ expect 2 "bad MODE refused" "$P/bin/parspackctl" doctor
 conf
 
 echo "== engine"
+conf MODE=TEST
+before_store="$(find "$FAKE_STORE" -type f | sort)"
+expect 3 "TEST mode uploads nothing and exits 3" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
+after_store="$(find "$FAKE_STORE" -type f | sort)"
+[[ "$before_store" == "$after_store" ]] && ok "TEST mode stored nothing" || bad "TEST mode stored data"
+conf
 export FAKE_MC_NOISE=1 FAKE_MC_FAIL_PUTS=1
 echo "noisy-retry" > "$B/noisy.tar.gz"
 chmod 644 "$B/noisy.tar.gz"
-expect 0 "noisy mc stdout cannot corrupt retry" "$E" "$B/noisy.tar.gz" "noisy.tar.gz"
-if grep -q "Retrying after" "$P/logs/backup.log" && ! grep -q "usage: retry-delay" "$P/logs/backup.log" && [[ -f "$FAKE_STORE/mybucket/cpanel/noisy.tar.gz" ]]; then
+expect 0 "noisy mc stdout cannot corrupt retry" "$E" "$B/noisy.tar.gz" "2026-08-01/noisy.tar.gz"
+if grep -q "Retrying after" "$P/logs/backup.log" && ! grep -q "usage: retry-delay" "$P/logs/backup.log" && [[ -f "$FAKE_STORE/mybucket/cpanel/2026-08-01/noisy.tar.gz" ]]; then
   ok "retry delay ignored noisy mc stdout"
 else
   bad "retry delay was corrupted by mc stdout"
 fi
 unset FAKE_MC_NOISE FAKE_MC_FAIL_PUTS
 rm -f "$FAKE_STORE/.fail-puts"
-conf MODE=TEST
-expect 3 "TEST mode uploads nothing and exits 3" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
-[[ -z "$(find "$FAKE_STORE" -type f -print -quit)" ]] && ok "TEST mode stored nothing" || bad "TEST mode stored data"
-conf
 expect 0 "PRODUCTION upload" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
 [[ -f "$FAKE_STORE/mybucket/cpanel/2026-09-28/u.tar.gz" ]] && ok "object stored under PARSPACK_PREFIX" || bad "prefix not applied"
 expect 0 "VERIFY skips a matching checksum" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
@@ -189,12 +191,45 @@ ln "$B/one.tar.gz" "$B/two.tar.gz"
 expect 1 "hard link is refused" "$E" "$B/two.tar.gz" "hard.tar.gz"
 rm -f "$B/two.tar.gz"
 echo "abc" > "$B/multi.tar.gz"
-expect 0 "multipart checksum falls back to full content" "$E" "$B/multi.tar.gz" "multipart.tar.gz"
-grep -q "full remote-content SHA256" "$P/logs/backup.log" && ok "content verification was logged" || bad "content verification was not logged"
+expect 0 "multipart checksum falls back to full content" "$E" "$B/multi.tar.gz" "2026-08-15/multipart.tar.gz"
+grep -q "Remote object content SHA256 verified" "$P/logs/backup.log" && ok "content verification was logged" || bad "content verification was not logged"
+echo "keep-local" > "$B/keep.tar.gz"
+chmod 644 "$B/keep.tar.gz"
+expect 0 "verified upload with local delete disabled" "$E" "$B/keep.tar.gz" "2026-08-03/keep.tar.gz"
+keep_status="$(python3 - "$P/state/parspack.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute(
+    "SELECT status FROM uploads WHERE remote_key LIKE ?",
+    ("%2026-08-03/keep.tar.gz",),
+).fetchone()
+print(row[0] if row else "")
+PY
+)"
+[[ "$keep_status" == "VERIFIED" && -f "$B/keep.tar.gz" && -f "$FAKE_STORE/mybucket/cpanel/2026-08-03/keep.tar.gz" ]] && ok "delete disabled leaves VERIFIED and the local file" || bad "verified state was $keep_status"
 conf DELETE_LOCAL_AFTER_SUCCESS=1
 echo "abc" > "$B/del.tar"
-expect 0 "local file removed after verified upload" "$E" "$B/del.tar" "del.tar"
-[[ ! -e "$B/del.tar" && -f "$FAKE_STORE/mybucket/cpanel/del.tar" ]] && ok "only the local file was deleted" || bad "local/remote delete result was wrong"
+expect 0 "local file removed after verified upload" "$E" "$B/del.tar" "2026-08-02/del.tar"
+[[ ! -e "$B/del.tar" && -f "$FAKE_STORE/mybucket/cpanel/2026-08-02/del.tar" ]] && ok "only the local file was deleted" || bad "local/remote delete result was wrong"
+export FAKE_MC_SHRINK_AFTER_SEEN=1
+echo "nodel" > "$B/nodel.tar.gz"
+chmod 644 "$B/nodel.tar.gz"
+expect 0 "recheck mismatch keeps the local file" "$E" "$B/nodel.tar.gz" "2026-08-04/nodel.tar.gz"
+if [[ -f "$B/nodel.tar.gz" && -f "$FAKE_STORE/mybucket/cpanel/2026-08-04/nodel.tar.gz" ]] && grep -q "Local delete skipped" "$P/logs/backup.log"; then
+  ok "local file is removed only after a successful recheck"
+else
+  bad "local file was removed before the remote recheck passed"
+fi
+unset FAKE_MC_SHRINK_AFTER_SEEN
+rm -rf "$FAKE_STORE/.seen"
+echo "yesdel" > "$B/yesdel.tar.gz"
+chmod 644 "$B/yesdel.tar.gz"
+expect 0 "local file removed after remote recheck" "$E" "$B/yesdel.tar.gz" "2026-08-05/yesdel.tar.gz"
+if [[ ! -e "$B/yesdel.tar.gz" && -f "$FAKE_STORE/mybucket/cpanel/2026-08-05/yesdel.tar.gz" ]] && grep -q "Deleted the local file after the remote size was rechecked" "$P/logs/backup.log"; then
+  ok "local file removed after re-verification"
+else
+  bad "local file was not removed after re-verification"
+fi
 conf
 if grep -qF -e "$SECRET" -e "$KEY" "$FAKE_ARGV_LOG"; then
   bad "credentials were visible on the mc command line"

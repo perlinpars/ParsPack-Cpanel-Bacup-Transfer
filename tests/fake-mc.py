@@ -89,6 +89,16 @@ def describe_file(path, name):
         payload["checksum"] = {"SHA256": encoded}
         if mode == "sha-and-etag":
             payload["etag"] = hashlib.md5(raw).hexdigest()
+    if os.environ.get("FAKE_MC_SHRINK_AFTER_SEEN") == "1":
+        seen_dir = os.path.join(store, ".seen")
+        os.makedirs(seen_dir, exist_ok=True)
+        token = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()
+        flag = os.path.join(seen_dir, token)
+        if os.path.isfile(flag):
+            payload["size"] = max(0, int(payload["size"]) - 1)
+        else:
+            with open(flag, "w", encoding="utf-8") as handle:
+                handle.write("1\n")
     return payload
 
 
