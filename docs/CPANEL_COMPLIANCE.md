@@ -14,7 +14,18 @@ Password arrives in `PASSWORD`. Each command is a new process. State must not be
 
 There is no official `describe` or `validate` command. WHM’s Validate action uses the commands below. This plugin treats a remote name matching `validate.tmp-<digits>-<digits>.txt` as that probe.
 
-The transport page does not publish a numeric exit-code table. The skeleton exits `1` for usage errors. Any non-zero status is treated below as failure. The pruning page separately says a transport process is limited to 300 seconds: [How to Troubleshoot a Remote Transport Pruning Failure](https://docs.cpanel.net/knowledge-base/backup/how-to-troubleshoot-a-remote-transport-pruning-failure/).
+The transport page does not publish a numeric exit-code table. The skeleton exits `1` for usage errors. Any non-zero status is a cPanel failure, and the reason is written to STDERR. The pruning page separately says a transport process is limited to 300 seconds: [How to Troubleshoot a Remote Transport Pruning Failure](https://docs.cpanel.net/knowledge-base/backup/how-to-troubleshoot-a-remote-transport-pruning-failure/).
+
+Exit status for this plugin:
+
+| Status | Meaning | STDERR |
+| --- | --- | --- |
+| 0 | The transport command succeeded. `put` in `MODE=TEST` does not use 0. | |
+| 1 | A path was refused (traversal, symlink, empty file, hard link, illegal remote name) or the operation failed. | `config error: ...` for a path refusal, or the engine log line for an operation failure |
+| 2 | The configuration is invalid: bad `MODE`, endpoint, prefix, permissions, or helper usage. `doctor` uses this status. | `config error: ...` |
+| 3 | `put` while `MODE=TEST`. Nothing was uploaded. | An info line that the bucket was checked and nothing was stored |
+
+A refused path is not a configuration error. `object-key`, `check-local`, `sha256`, and `remote-compose` exit 1 after a valid configuration has loaded. Loading that configuration still exits 2 when the file itself is wrong. cPanel treats every non-zero status as a failed transfer.
 
 | Command | Documented contract | This plugin | Deviation |
 | --- | --- | --- | --- |

@@ -105,6 +105,23 @@ class ConfigError(Exception):
         super(ConfigError, self).__init__("; ".join(self.errors))
 
 
+class PathRefusal(ConfigError):
+    """A local or remote path was rejected. Transport helpers exit 1.
+
+    Invalid configuration still raises ConfigError and exits 2. Both are
+    non-zero, and both print the reason on stderr.
+    """
+
+
+def as_path_refusal(func):
+    try:
+        return func()
+    except PathRefusal:
+        raise
+    except ConfigError as exc:
+        raise PathRefusal(exc.errors)
+
+
 def is_root():
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
@@ -1844,26 +1861,31 @@ def dispatch(argv):
                 dated = True
             else:
                 raise ConfigError("usage: remote-compose [--cwd DIR] [--dated LOCAL] -- PATH")
-        sys.stdout.write(compose_remote(cwd, take_operand(rest), hint, dated) + "\n")
+        path = take_operand(rest)
+        sys.stdout.write(as_path_refusal(lambda: compose_remote(cwd, path, hint, dated)) + "\n")
         return 0
     if command == "object-key":
         conf = load_valid()
-        target = object_target(
+        operand = take_operand(args)
+        target = as_path_refusal(lambda: object_target(
             conf,
-            take_operand(args),
+            operand,
             allow_empty="--allow-empty" in args,
             require_child="--require-child" in args,
-        )
+        ))
         sys.stdout.write(target + "\n")
         return 0
     if command == "check-local":
         kind, cwd, path = take_check_local(args)
-        real = check_local(kind, path, load_valid(), cwd)
+        conf = load_valid()
+        real = as_path_refusal(lambda: check_local(kind, path, conf, cwd))
         sys.stdout.write(real + "\n")
         return 0
     if command == "sha256":
         require_root()
-        real = check_local("read", take_operand(args), load_valid())
+        conf = load_valid()
+        operand = take_operand(args)
+        real = as_path_refusal(lambda: check_local("read", operand, conf))
         sys.stdout.write(sha256_file(real) + "\n")
         return 0
     if command == "tighten-file":
@@ -2163,6 +2185,10 @@ def main(argv=None):
         return 1
     try:
         return dispatch(sys.argv if argv is None else argv)
+    except PathRefusal as exc:
+        for item in exc.errors:
+            print("config error: %s" % item, file=sys.stderr)
+        return 1
     except ConfigError as exc:
         for item in exc.errors:
             print("config error: %s" % item, file=sys.stderr)
