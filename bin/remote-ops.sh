@@ -20,6 +20,29 @@ cmd="${1:-}"
 [[ -n "$cmd" ]] || { usage; exit 2; }
 shift
 
+# A missing prefix is an empty listing. mc may report that on stderr or stdout.
+ls_one() {
+  local target="$1" errf listing status outf
+  errf="$(pp_mktemp)"
+  set +e
+  listing="$(pp_mc ls --json -- "$target" 2>"$errf")"
+  status=$?
+  set -e
+  outf="$(pp_mktemp)"
+  printf '%s\n' "$listing" > "$outf"
+  if [[ "$status" -ne 0 ]]; then
+    if pp_py stat-missing -- "$errf" || pp_py stat-missing -- "$outf"; then
+      return 0
+    fi
+    return 1
+  fi
+  if pp_py stat-missing -- "$outf"; then
+    return 0
+  fi
+  printf '%s\n' "$listing"
+  return 0
+}
+
 case "$cmd" in
   mkdir)
     rel="${1:-}"
@@ -38,28 +61,24 @@ case "$cmd" in
   ls)
     rel="${1:-}"
     target="$(pp_py object-key --allow-empty -- "$rel")"
-    errf="$(pp_mktemp)"
     set +e
-    listing="$(pp_mc ls --json -- "${target}/" 2>"$errf")"
+    listing="$(ls_one "${target}/")"
     status=$?
     set -e
     if [[ "$status" -ne 0 ]]; then
-      if pp_py stat-missing -- "$errf"; then
-        exit 0
-      fi
       pp_die "Remote listing failed"
     fi
     if [[ -z "$listing" && -n "$rel" && "$rel" != "/" ]]; then
       set +e
-      listing="$(pp_mc ls --json -- "$target" 2>"$errf")"
+      listing="$(ls_one "$target")"
       status=$?
       set -e
       if [[ "$status" -ne 0 ]]; then
-        if pp_py stat-missing -- "$errf"; then
-          exit 0
-        fi
         pp_die "Remote listing failed"
       fi
+    fi
+    if [[ -z "$listing" ]]; then
+      exit 0
     fi
     printf '%s\n' "$listing" | pp_py format-ls
     ;;

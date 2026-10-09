@@ -54,7 +54,11 @@ def location(target):
 
 
 def missing():
-    sys.stdout.write('{"status":"error","error":{"message":"Object does not exist"}}\n')
+    # Real mc writes this on stderr. Keep a copy on stdout too so a caller
+    # that only captured one stream still sees a missing object.
+    message = '{"status":"error","error":{"message":"Object does not exist"}}\n'
+    sys.stderr.write(message)
+    sys.stdout.write(message)
     sys.exit(1)
 
 
