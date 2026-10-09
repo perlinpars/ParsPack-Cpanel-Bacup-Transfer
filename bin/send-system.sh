@@ -7,7 +7,12 @@ IFS=$' \t\n'
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 umask 077
 
-if [[ "${1:-}" != "--run" || $# -ne 3 ]]; then
+if [[ "${1:-}" == "--complete" ]]; then
+  if [[ $# -ne 3 ]]; then
+    echo "usage: $0 --complete LOCAL_DAY REMOTE_BASE" >&2
+    exit 2
+  fi
+elif [[ "${1:-}" != "--run" || $# -ne 3 ]]; then
   echo "started" >&2
   exit 0
 fi
@@ -29,31 +34,57 @@ fi
 
 pp_bootstrap
 
-account_name="$(basename "$LOCAL_ACCOUNT")"
-suffix="/accounts/${account_name}"
-if [[ "$LOCAL_ACCOUNT" != /* || "$LOCAL_ACCOUNT" != *"$suffix" || "$REMOTE_ACCOUNT" != *"$suffix" ]]; then
-  pp_log ERROR "system mirror refused an unexpected account path"
-  exit 2
-fi
-if [[ "$account_name" == validate.tmp-* || ! "$account_name" =~ ^[A-Za-z0-9._+-]+\.tar\.gz$ ]]; then
-  exit 0
-fi
+if [[ "${1:-}" == "--complete" ]]; then
+  local_day="$2"
+  remote_base="$3"
+  if [[ -z "$local_day" || "$local_day" == "/" || "$local_day" != /* || -L "$local_day" || ! -d "$local_day" ]]; then
+    pp_log ERROR "system mirror refused an unexpected backup directory"
+    exit 2
+  fi
+  day_name="$(basename "$local_day")"
+  if [[ ! "$day_name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    pp_log ERROR "system mirror refused a backup directory without a date"
+    exit 2
+  fi
+  if [[ "$remote_base" != "$day_name" && "$remote_base" != */"$day_name" ]]; then
+    pp_log ERROR "system mirror refused a remote base that is not the backup day"
+    exit 2
+  fi
+  pp_py object-key --require-child -- "$remote_base/system/.keep" >/dev/null
+  system_dir="$local_day/system"
+  if [[ -L "$system_dir" ]]; then
+    pp_log ERROR "system mirror refused a symlink"
+    exit 2
+  fi
+else
+  LOCAL_ACCOUNT="$2"
+  REMOTE_ACCOUNT="$3"
+  account_name="$(basename "$LOCAL_ACCOUNT")"
+  suffix="/accounts/${account_name}"
+  if [[ "$LOCAL_ACCOUNT" != /* || "$LOCAL_ACCOUNT" != *"$suffix" || "$REMOTE_ACCOUNT" != *"$suffix" ]]; then
+    pp_log ERROR "system mirror refused an unexpected account path"
+    exit 2
+  fi
+  if [[ "$account_name" == validate.tmp-* || ! "$account_name" =~ ^[A-Za-z0-9._+-]+\.tar\.gz$ ]]; then
+    exit 0
+  fi
 
-local_day="${LOCAL_ACCOUNT%"$suffix"}"
-remote_base="${REMOTE_ACCOUNT%"$suffix"}"
-if [[ -z "$local_day" || "$local_day" == "/" || "$local_day" != /* ]]; then
-  pp_log ERROR "system mirror refused an unexpected backup directory"
-  exit 2
-fi
-day_name="$(basename "$local_day")"
-if [[ ! "$day_name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-  pp_log ERROR "system mirror refused a backup directory without a date"
-  exit 2
-fi
-system_dir="$local_day/system"
-if [[ -L "$local_day" || -L "$system_dir" ]]; then
-  pp_log ERROR "system mirror refused a symlink"
-  exit 2
+  local_day="${LOCAL_ACCOUNT%"$suffix"}"
+  remote_base="${REMOTE_ACCOUNT%"$suffix"}"
+  if [[ -z "$local_day" || "$local_day" == "/" || "$local_day" != /* ]]; then
+    pp_log ERROR "system mirror refused an unexpected backup directory"
+    exit 2
+  fi
+  day_name="$(basename "$local_day")"
+  if [[ ! "$day_name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    pp_log ERROR "system mirror refused a backup directory without a date"
+    exit 2
+  fi
+  system_dir="$local_day/system"
+  if [[ -L "$local_day" || -L "$system_dir" ]]; then
+    pp_log ERROR "system mirror refused a symlink"
+    exit 2
+  fi
 fi
 
 safe_rel() {
@@ -135,6 +166,21 @@ deadline=$(( $(date +%s) + ${SYSTEM_DEADLINE_SECONDS:-21600} ))
 previous_set=""
 stable_since=0
 gate="waiting"
+if [[ "${1:-}" == "--complete" ]]; then
+  # Same gate as the detached mirror, without waiting. A day that is not
+  # already terminal stays pending and the marker is not removed.
+  names=""
+  account_names <<< "$(account_set || true)"
+  now="$(date +%s)"
+  set +e
+  gate="$(pp_state accounts-ready --date "$day_name" --names "$names" --set-stable 1 --now "$now" --deadline "$((now + 10))")"
+  gate_rc=$?
+  set -e
+  if [[ "$gate_rc" -ne 0 || "$gate" != "ready" ]]; then
+    pp_log ERROR "system tree is not a complete verified day; marker kept for $day_name"
+    exit 1
+  fi
+else
 pp_state set-run --date "$day_name" --state open || true
 pp_log INFO "Waiting until every account tar in $local_day/accounts is terminal, or until the system deadline"
 while (( $(date +%s) < deadline )); do
@@ -170,6 +216,7 @@ if [[ "$gate" != "ready" ]]; then
   gate="partial"
   pp_state set-run --date "$day_name" --state partial || true
   pp_log ERROR "system mirror deadline reached before every expected account was terminal; day $day_name is partial and manifest.json will not be uploaded"
+fi
 fi
 
 if [[ "$gate" == "partial" && ! -d "$system_dir" ]]; then

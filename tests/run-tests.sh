@@ -278,6 +278,36 @@ grep -q 'my ($local_file, $dest_file) = @args\[0, 1\];' "$P/transport/parspack_t
 grep -q 'my ($remote_file, $local_file) = @args\[0, 1\];' "$P/transport/parspack_transport.pl" && ok "get follows the Perl skeleton argument order" || bad "get argument order changed"
 grep -q 'exit 3' "$P/bin/engine-upload.sh" && ok "TEST mode put still exits 3" || bad "TEST mode exit 3 was removed"
 
+echo "== pending marker"
+DAY=2026-10-02
+mkdir -p "$B/$DAY/accounts" "$B/$DAY/system"
+chmod 700 "$B/$DAY" "$B/$DAY/accounts" "$B/$DAY/system"
+echo "account-body" > "$B/$DAY/accounts/alpha.tar.gz"
+echo "system-body" > "$B/$DAY/system/meta.txt"
+chmod 644 "$B/$DAY/accounts/alpha.tar.gz" "$B/$DAY/system/meta.txt"
+conf
+expect 0 "account upload before system completion" "$E" "$B/$DAY/accounts/alpha.tar.gz" "$DAY/accounts/alpha.tar.gz"
+mkdir -p "$P/state"
+printf 'date=%s\n' "$DAY" > "$P/state/system-pending-$DAY"
+chmod 600 "$P/state/system-pending-$DAY"
+export FAKE_MC_FAIL_PUTS=9
+run_to "$P/bin/send-remaining.sh" --run
+if [[ "$RUN_RC" -ne 0 && -f "$P/state/system-pending-$DAY" ]]; then
+  ok "pending marker stays until the system tree is verified"
+else
+  bad "pending marker was removed before the system tree was verified (rc=$RUN_RC)"
+  sed 's/^/        /' "$T/out" | head -12
+fi
+unset FAKE_MC_FAIL_PUTS
+rm -f "$FAKE_STORE/.fail-puts"
+run_to "$P/bin/send-system.sh" --complete "$B/$DAY" "$DAY"
+if [[ "$RUN_RC" -eq 0 && ! -e "$P/state/system-pending-$DAY" && -f "$FAKE_STORE/mybucket/cpanel/$DAY/system/meta.txt" && -f "$FAKE_STORE/mybucket/cpanel/$DAY/manifest.json" ]]; then
+  ok "pending marker removed after send-system verified the tree"
+else
+  bad "pending marker was not cleared by the verified system path (rc=$RUN_RC)"
+  sed 's/^/        /' "$T/out" | head -20
+fi
+
 echo
 echo "passed=$PASS_N failed=$FAIL_N"
 if [[ "$FAIL_N" -ne 0 ]]; then

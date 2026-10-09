@@ -141,6 +141,7 @@ if [[ "$line" =~ ^RESULT\ sent=([0-9]+)\ failed=([0-9]+)\ skipped=([0-9]+)\ syst
   SYSTEM_SEEN="${BASH_REMATCH[4]}"
   SYSTEM_FAILED="${BASH_REMATCH[5]}"
   TOTAL=$((SENT + FAILED + SKIPPED))
+  pp_log INFO "manual retry sent=$SENT failed=$FAILED skipped=$SKIPPED system_seen=$SYSTEM_SEEN system_failed=$SYSTEM_FAILED"
 else
   write_status failed "ارسال دستی نتوانست وضعیت را بخواند"
   exit 1
@@ -153,8 +154,20 @@ fi
 CURRENT=""
 marker="$STATE_DIR/system-pending-$DAY"
 if [[ -f "$marker" && ! -L "$marker" ]]; then
-  if (( SYSTEM_SEEN > 0 && SYSTEM_FAILED == 0 )); then
-    rm -f -- "$marker"
+  # Only send-system.sh removes the marker, and only after the same
+  # verified-tree path that uploads manifest.json.
+  day_dir=""
+  IFS=':' read -ra roots <<< "$LOCAL_READ_ROOTS"
+  for root in "${roots[@]}"; do
+    if [[ -d "$root/$DAY" && ! -L "$root/$DAY" && -d "$root/$DAY/accounts" && ! -L "$root/$DAY/accounts" ]]; then
+      day_dir="$root/$DAY"
+      break
+    fi
+  done
+  if [[ -n "$day_dir" ]]; then
+    set +e
+    "$ROOT/bin/send-system.sh" --complete "$day_dir" "$DAY"
+    set -e
   fi
   if [[ -e "$marker" ]]; then
     note_incomplete "$DAY"
