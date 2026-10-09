@@ -343,6 +343,73 @@ else
   sed 's/^/        /' "$T/out" | head -20
 fi
 
+echo "== transport compile"
+if ! command -v perl >/dev/null 2>&1; then
+  bad "perl -c transport (perl is not installed)"
+else
+  if perl -c "$P/transport/parspack_transport.pl" >"$T/perl-c.out" 2>&1; then
+    ok "perl -c transport"
+  else
+    bad "perl -c transport"
+    sed 's/^/        /' "$T/perl-c.out" | head -8
+  fi
+fi
+python3 - "$P" >"$T/fsync-scan.out" 2>&1 <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+use_re = re.compile(r"^[ \t]*use[ \t]+POSIX\b(.*?);", re.M | re.S)
+failed = False
+for path in root.rglob("*.pl"):
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if "POSIX::fsync" in text:
+        print("%s: POSIX::fsync" % path)
+        failed = True
+    for match in use_re.finditer(text):
+        if re.search(r"\bfsync\b", match.group(1)):
+            print("%s: fsync in use POSIX" % path)
+            failed = True
+sys.exit(1 if failed else 0)
+PY
+scan_rc=$?
+if [[ "$scan_rc" -eq 0 ]]; then
+  ok "no POSIX::fsync in perl files"
+else
+  bad "POSIX::fsync is present in a perl file"
+  sed 's/^/        /' "$T/fsync-scan.out" | head -8
+fi
+
+echo "== install fail closed"
+INST="$T/install-src"
+mkdir -p "$INST"
+tar -C "$P" --exclude=__pycache__ -cf - . | tar -C "$INST" -xf -
+printf '\nthis is not valid perl {\n' >> "$INST/transport/parspack_transport.pl"
+LIVE_DIR="$T/live-cpanel/scripts"
+WHM_DIR="$T/live-cpanel/whm"
+mkdir -p "$LIVE_DIR" "$WHM_DIR"
+printf 'original-live-transport\n' > "$LIVE_DIR/parspack_custom_transport.pl"
+printf 'original-live-ui\n' > "$WHM_DIR/index.php"
+chmod 700 "$LIVE_DIR/parspack_custom_transport.pl" "$WHM_DIR"
+chmod 644 "$WHM_DIR/index.php"
+before="$(find "$T/live-cpanel" -type f -printf '%p %s\n' | sort)"
+PARSPACK_INSTALL_TEST=1 \
+  PARSPACK_TRANSPORT_DST="$LIVE_DIR/parspack_custom_transport.pl" \
+  PARSPACK_WHM_UI_DIR="$WHM_DIR" \
+  bash "$INST/install.sh" >"$T/install.out" 2>&1
+install_rc=$?
+after="$(find "$T/live-cpanel" -type f -printf '%p %s\n' | sort)"
+live_body="$(cat "$LIVE_DIR/parspack_custom_transport.pl")"
+ui_body="$(cat "$WHM_DIR/index.php")"
+stray="$(find "$T/live-cpanel" \( -name '*.bak.*' -o -name '.parspack-stage.*' \) -print)"
+if [[ "$install_rc" -ne 0 && "$live_body" == "original-live-transport" && "$ui_body" == "original-live-ui" && "$before" == "$after" && -z "$stray" ]] && grep -q "CHECK FAILED: perl -c" "$T/install.out"; then
+  ok "broken transport source leaves the live file untouched"
+else
+  bad "broken transport source mutated the live tree or did not fail perl -c (rc=$install_rc)"
+  sed 's/^/        /' "$T/install.out" | head -20
+fi
+
 echo
 echo "passed=$PASS_N failed=$FAIL_N"
 if [[ "$FAIL_N" -ne 0 ]]; then
