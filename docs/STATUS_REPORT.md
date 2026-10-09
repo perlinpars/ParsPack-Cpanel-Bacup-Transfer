@@ -10,10 +10,11 @@
 
 ## 1. Executive summary
 
-1. Offline suite: **passed=75 failed=0**.
+1. Offline suite: **passed=78 failed=0**.
 2. `ALLOW_REMOTE_DELETE` and `DELETE_LOCAL_AFTER_SUCCESS` stay **0** in `config/parspack.conf.example`. No guard was relaxed. The cPanel argument order for `put` and `get` is unchanged.
 3. The previous blockers are fixed: `get` field splitting, `retry-delay` argv, suite abort under `set -e`, phase 5 under root, path-versus-config exit codes, `ls` of a missing directory, and pending-marker removal.
 4. This is still not a live-bucket proof. ParsPack S3, TLS, the cPanel 300 second limit, and a real `setsid` detach were not exercised.
+5. Mock tests cannot catch a compile error in the cPanel host's Perl. `perl -c transport/parspack_transport.pl` on the target server, using `/usr/bin/perl`, is a mandatory pre-install check. `install.sh` now runs that check on the source file and refuses to replace the live transport if it fails.
 
 ---
 
@@ -30,6 +31,10 @@
 | `7f66231` | `send-remaining` no longer deletes `system-pending-*` from its own counters. Only `send-system.sh` removes it, after the same verified-tree and manifest path. |
 | `959bd7e` | Fake-mc coverage for a verified upload with local delete off (state `VERIFIED`) and with delete on and delay 0. The local file is removed only after a second remote size check. A shrunk recheck keeps the file. |
 | `bc71d3c` | Shellcheck warning clean. Ruff pyflakes findings fixed (`ssl` unused, `doctor` catching `ConfigError`, unused probe fd). |
+| `2143177` | Pending-marker durability uses `IO::Handle` `flush` and `sync`. `POSIX::fsync` is not imported. A failed sync still fails that `put`. |
+| `670144f` | Compliance note: system `/usr/bin/perl` runs the transport, and every `use` is core on Perl 5.16+. |
+| `0dd228d` | `install.sh` validates sources before it touches the live transport or WHM page, then replaces each file by rename and restores the backup if a later step fails. |
+| `719163e` | The suite runs `perl -c`, rejects `POSIX::fsync` in `.pl` files, and proves a broken transport source leaves the live file untouched. |
 
 ---
 
@@ -41,15 +46,17 @@
 - **ls.** A missing prefix prints nothing and exits 0. The previous rc=1 came from `fake-mc` writing `Object does not exist` on stdout while `remote-ops` only inspected stderr.
 - **Pending marker.** `send-remaining --run` calls `send-system.sh --complete`. The marker stays when the account set is not terminal or a system file fails. It is removed only after the system tree and `manifest.json` are verified.
 - **Upload log.** A whole-object content hash used during publish is logged as `Remote object content SHA256 verified`.
+- **Pending marker.** The file is still written, renamed into place, and forced to mode `0600`. Durability of the file contents is `IO::Handle::flush` then `IO::Handle::sync`. A sync failure deletes the temp file and `put` exits 1 with the same STDERR line as any other marker failure. The `state/` directory is still not synced. `put` and `get` argument order and the other exit codes are unchanged.
+- **Install.** A failed `perl -c`, `php -l`, `bash -n`, or `python3 -m py_compile` exits non-zero and does not replace `/usr/local/cpanel/scripts/parspack_custom_transport.pl` or the WHM `index.php`. `config/parspack.conf`, `mc-config/`, and `state/` are not overwritten. Mode `600` is applied only to regular files directly in `lib/`.
 
-Defaults that did not change: `ALLOW_REMOTE_DELETE=0`, `DELETE_LOCAL_AFTER_SUCCESS=0`, `DELETE_LOCAL_DELAY=0` when the key is omitted.
+Defaults that did not change: `ALLOW_REMOTE_DELETE=0`, `DELETE_LOCAL_AFTER_SUCCESS=0`, `DELETE_LOCAL_DELAY=0` when the key is omitted. Remote delete and local delete stay off.
 
 ---
 
 ## 4. Test result
 
 Command: `wsl -u root -- bash tests/run-tests.sh`  
-Result: **passed=75 failed=0**
+Result: **passed=78 failed=0** (the stabilization run before the compile fix was passed=75 failed=0)
 
 Covered additions:
 
@@ -62,8 +69,11 @@ Covered additions:
 - delete disabled: row `VERIFIED`, local file kept
 - delete enabled, delay 0, recheck size mismatch: local file kept
 - delete enabled, delay 0, recheck matches: local file removed after the recheck log line
+- `perl -c` on the transport (the suite fails if `perl` is missing)
+- no `POSIX::fsync` and no `fsync` inside a `use POSIX` import in any `.pl` file
+- a broken transport source makes `install.sh` exit non-zero and leaves the fake live transport and WHM page byte-for-byte unchanged
 
-What the mock still cannot prove: live ParsPack multipart ETags, TLS, the 300 second kill, a real `setsid` failure, overlapping cPanel puts, or WHM AppConfig registration on a host.
+What the mock still cannot prove: live ParsPack multipart ETags, TLS, the 300 second kill, a real `setsid` failure, overlapping cPanel puts, or WHM AppConfig registration on a host. It also cannot catch a compile error that exists only in the cPanel server's Perl. The suite's `perl -c` runs whatever `perl` is installed on the machine that runs the tests (here, Perl 5.38 under WSL). That is not a substitute for `perl -c` on the server.
 
 ---
 
@@ -106,12 +116,13 @@ Remaining ruff default-set findings (style and modernization, 245):
 
 ## 6. Residual risk
 
-1. Live transport, TLS, and the 300 second limit are untested.
-2. Remote delete is implemented and default off. Turning `ALLOW_REMOTE_DELETE` on can delete a date folder that passes the guards.
-3. Local delete is default off. With the flag on and delay 0, deletion happens only after a second size check. A wrong verify would still be able to remove the local archive.
-4. `put` can exit 0 when the system mirror fails to detach. The pending marker stays and is reported as CRITICAL.
-5. `mc` still opens the local path by name after the inode check (TOCTOU).
-6. An upload-lock wait that expires fails that `put`. cPanel does not retry it by itself.
+1. Live transport, TLS, and the 300 second limit are untested. The offline suite cannot see an unimplemented function in the server's Perl. Run `perl -c` on the server before install.
+2. The pending-marker directory entry is still not synced. A crash immediately after `rename` can lose the marker name. The next account `put` for that day writes it again. A failed sync of the file itself still fails that `put`.
+3. Remote delete is implemented and default off. Turning `ALLOW_REMOTE_DELETE` on can delete a date folder that passes the guards.
+4. Local delete is default off. With the flag on and delay 0, deletion happens only after a second size check. A wrong verify would still be able to remove the local archive.
+5. `put` can exit 0 when the system mirror fails to detach. The pending marker stays and is reported as CRITICAL.
+6. `mc` still opens the local path by name after the inode check (TOCTOU).
+7. An upload-lock wait that expires fails that `put`. cPanel does not retry it by itself.
 
 ---
 
@@ -133,6 +144,7 @@ Unchanged in intent. Run on a staging host with a disposable prefix. Keep both d
 
 | # | Action | Expected |
 | --- | --- | --- |
+| 0 | On the server, before `install.sh`: `perl -c /root/parspack-backup/transport/parspack_transport.pl` and confirm `perl` is `/usr/bin/perl` | `syntax OK`, exit 0. If this fails, do not install. `install.sh` repeats the check and will not replace the live transport. |
 | 1 | `MODE=TEST`, `parspackctl doctor` | Warnings only; no upload |
 | 2 | WHM Validate | Probe object; backup `put` exits 3 |
 | 3 | `MODE=PRODUCTION`, both delete flags 0, one account | Object under `prefix/YYYY-MM-DD/accounts/`; marker appears and clears after the mirror |
