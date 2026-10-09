@@ -53,6 +53,37 @@ Local retention is separate. [Backup Configuration](https://docs.cpanel.net/whm/
 
 cPanel does not send the plugin the list of accounts for the run. The expected set is the regular `accounts/*.tar.gz` files in the local date directory, excluding `validate.tmp-*`. The detached system mirror, not `put`, waits until each of those accounts is terminal or until `SYSTEM_DEADLINE_SECONDS`. `put` still only writes the pending marker and detaches.
 
+## Which Perl runs the transport
+
+The file cPanel is configured to run is `/usr/local/cpanel/scripts/parspack_custom_transport.pl`. `install.sh` copies `transport/parspack_transport.pl` to that path. cPanel starts a new process with that path as the program (command, current directory, command arguments, host, username, and `PASSWORD` in the environment). The kernel then honors the script shebang.
+
+The shebang is `#!/usr/bin/perl`. That is the system Perl, the same binary `perl` resolves to under `install.sh`'s `PATH` (`/usr/bin` is on that path, and `/usr/local/cpanel/3rdparty/bin` is not). It is not `/usr/local/cpanel/3rdparty/bin/perl`.
+
+The production failure loaded `POSIX.pm` from `/usr/lib64/perl5/POSIX.pm`. That directory belongs to the RHEL-family system Perl. cPanel's third-party Perl keeps its libraries under `/usr/local/cpanel/3rdparty/perl/`. `perl -c` before install must be this system Perl, because that is the one that will execute the shebang.
+
+## Modules the transport loads
+
+Every `use` in `transport/parspack_transport.pl` is a core module in Perl 5.16.3 (RHEL 7) and in the later system Perls shipped on RHEL 8 (5.26) and RHEL 9 (5.32). None come from CPAN.
+
+| Statement | Role | Core since |
+| --- | --- | --- |
+| `use strict` | Pragma | 5.0, still core |
+| `use warnings` | Pragma | 5.6, still core |
+| `use Fcntl qw(O_WRONLY O_APPEND O_CREAT O_NOFOLLOW O_EXCL F_GETFD F_SETFD FD_CLOEXEC)` | Open and fd flags | 5.0 (`Fcntl`). `O_NOFOLLOW` is present on Linux; this host compiled past that import |
+| `use IO::Handle` | `flush` and `sync` on the pending-marker handle | 5.003 (`IO`) |
+| `use IO::Select` | Two-second read on the detach pipe | 5.003 (`IO`) |
+| `use POSIX qw(strftime setsid)` | Log timestamps and detach. `fsync` is not imported | 5.0. `strftime` and `setsid` are implemented on Linux |
+
+`POSIX::fsync` is not implemented in this system Perl. Importing it aborts compilation inside `POSIX.pm` before any command runs. The marker file is synced with `$fh->flush` then `$fh->sync`. Both return numeric 0 on success (the POD's "0 but true") and `-1` or `undef` on failure. The writer treats any other result as a failed marker, deletes the temp file, and `put` exits 1 with a STDERR line. STDOUT stays empty.
+
+The `state/` directory is not synced. The old code did not sync it either: `fsync` ran only on the file descriptor. A directory sync is not added. If one is needed later, open the directory and call `IO::Handle::sync` only when that call works; if the platform does not implement it, skip it and say so. Do not call `POSIX::fsync`.
+
+No other Perl, shell, or PHP file calls `fsync`. `lib/parspack_config.py` calls `os.fsync` after `flush` when rewriting `parspack.conf` and the `mc` config. That is CPython's wrapper for `fsync(2)` and is valid on this runtime. An `OSError` from it still fails that rewrite.
+
+## Perl 5.16 language level
+
+The transport does not enable a feature bundle and does not use signatures, `say`, `state`, `given`/`when`, `fc`, postfix dereferencing, or `try`. The only syntax newer than Perl 5.8 is the defined-or operator `//` in the `get` argument check. That operator has been unconditional syntax since Perl 5.10, so it is valid on 5.16. `strict` and `warnings` are on. `perl -c` may still warn that the statement after `exec` looks unreachable; that line runs when `exec` fails, and the warning does not fail compilation.
+
 ## Not specified by the transport page
 
 - No per-command timeout other than the 300 second pruning note.
