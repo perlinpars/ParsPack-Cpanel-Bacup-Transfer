@@ -3,7 +3,7 @@
 **Date:** 2026-10-09  
 **Tree:** `parspack-backup-plugin` VERSION `0.3.0`  
 **Baseline:** `69c67f1` (pre-stabilization commit)  
-**HEAD:** `bc71d3c`  
+**Tip:** every commit after that baseline, including this report.  
 **Method:** `tests/run-tests.sh` as root under WSL against `tests/fake-mc.py` only. No live bucket.
 
 ---
@@ -120,7 +120,7 @@ Remaining ruff default-set findings (style and modernization, 245):
 The pre-fix tree is `69c67f1`. To undo the stabilization commits:
 
 ```bash
-git revert --no-commit 69c67f1..bc71d3c
+git revert --no-commit 69c67f1..HEAD
 ```
 
 or check out `69c67f1` if this history has not been published. Do not reset a commit that has already been pushed unless that is an explicit request.
