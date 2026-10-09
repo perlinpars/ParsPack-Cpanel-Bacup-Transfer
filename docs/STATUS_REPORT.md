@@ -120,7 +120,7 @@ Remaining ruff default-set findings (style and modernization, 245):
 The pre-fix tree is `69c67f1`. To undo the stabilization commits:
 
 ```bash
-git revert --no-commit 3f31605^..bc71d3c
+git revert --no-commit 69c67f1..bc71d3c
 ```
 
 or check out `69c67f1` if this history has not been published. Do not reset a commit that has already been pushed unless that is an explicit request.
