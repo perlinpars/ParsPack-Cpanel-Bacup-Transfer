@@ -1,93 +1,250 @@
-# PARSPACK Backup for cPanel & WHM
+# راهنمای راه‌اندازی PARSPACK Backup روی سرور cPanel/WHM
 
-Commercial-grade foundation for direct cPanel backup transport to PARSPACK S3-compatible Object Storage.
+نسخه هدف: **v1.0**  
+مسیر نصب ثابت: `/root/parspack-backup`
 
-## Architecture
+این پلاگین بکاپ روزانه cPanel را به فضای ابری S3-سازگار پارس‌پک منتقل می‌کند. آپلود جداگانه‌ای با cron ندارد؛ همان Backup Destination سفارشی WHM کار را انجام می‌دهد.
 
-Primary transport:
+---
 
-cPanel Backup -> Custom Transport -> PARSPACK Engine -> S3 Multipart -> PARSPACK
+## ۱) پیش‌نیازها
 
-The transport is intentionally stateless because cPanel invokes custom transport commands independently. Durable state, reports, configuration and audit data live in the project directory.
+روی سرور (به‌عنوان `root`):
 
-## Project layout
+| مورد | توضیح |
+|---|---|
+| cPanel/WHM | AlmaLinux / Rocky / CloudLinux متداول |
+| `mc` | در مسیر `/usr/local/bin/mc` |
+| `python3` | سیستم (`/usr/bin/python3`) |
+| `perl` | سیستم (`/usr/bin/perl`) برای transport |
+| مسیر بکاپ محلی | مثلاً `/backup` یا `/MainBackup` — باید root-owned و بدون write برای group/other باشد |
+| دسترسی S3 | Endpoint با `https://`، Access Key، Secret Key، نام باکت |
 
-- `config/` configuration
-- `bin/` CLI, upload engine (`engine-upload.sh`), and non-upload remote
-  operations (`remote-ops.sh`: ls/mkdir/chdir/get/delete/delete-validation/rmdir)
-- `transport/` cPanel Custom Backup Destination transport
-- `lib/` shared helpers
-- `tests/` offline checks. Run `tests/run-tests.sh` as root on the server
-- `state/` runtime state and history
-- `logs/` logs
-- `reports/` generated reports
-- `whm/` WHM plugin package (deployed by `install.sh` to cPanel's docroot)
-- `install.sh` installer
-- `uninstall.sh` uninstaller
-- `upgrade.sh` upgrade helper
+بررسی سریع:
 
-**Fixed install path:** the transport script and cron job reference this
-project at `/root/parspack-backup` directly (see Installation below). Don't
-move the extracted folder after installing without re-running `install.sh`
-and updating the hardcoded path in `transport/parspack_transport.pl`.
+```bash
+which mc
+mc --version
+python3 --version
+perl -v | head -n 2
+ls -ld /backup /MainBackup 2>/dev/null
+```
 
-## Safety defaults
+---
 
-- `MODE=TEST` checks the local file, the remote path, and that the bucket can be listed, then exits 3 without creating an object
-- each backup object keeps the Gregorian `YYYY-MM-DD` directory cPanel already supplied. The transport does not choose a new day from the clock
-- a new upload is written to a `.uploading` object, copied to the final name, verified there, and only then is `.uploading` removed
-- `REMOTE_EXISTS_POLICY=VERIFY` keeps an existing object when its size and sha256 match. If the size matches but `mc stat` has no comparable sha256, the engine hashes the full remote content. A different object is left unchanged and the upload fails
-- `REPLACE` overwrites only when `MODE=PRODUCTION`
-- `PARSPACK_PREFIX` is applied to `put`, `get`, `ls`, `mkdir`, `chdir`, `delete`, and `rmdir`
-- S3 credentials are stored in `mc-config/config.json` with mode `600`. They are not passed on the `mc` command line
-- the WHM custom destination password must match `TRANSPORT_PASSWORD`
-- the endpoint must be `https://`
-- backup files must stay inside root-owned directories that are not writable by group or others
-- a new upload stores sha256 metadata and the remote object is checked after the transfer. The local file is removed only after that check succeeds. A failed check leaves both the local file and the remote object in place
+## ۲) دریافت کد روی سرور
 
-## Phase 1
+فقط در مسیر ثابت نصب کنید:
 
-This phase installs the engine and cPanel custom transport. The WHM plugin has two tabs: a report of the latest backup (accounts, success, and failure) and notification settings. The report tab can send the latest day's remaining account archives once; each file then stops after `RETRY_COUNT` tries. S3 keys and the transport password stay in `config/parspack.conf` and are not shown in WHM.
+```bash
+cd /root
+git clone https://github.com/perlinpars/ParsPack-Cpanel-Bacup-Transfer.git parspack-backup
+# یا از تگ نسخه:
+# git clone --branch v1.0 https://github.com/perlinpars/ParsPack-Cpanel-Bacup-Transfer.git parspack-backup
 
-## Installation
+cd /root/parspack-backup
+chmod 700 install.sh uninstall.sh upgrade.sh bin/* transport/*
+```
 
-1. Extract this package under `/root/parspack-backup`.
-2. Copy `config/parspack.conf.example` to `config/parspack.conf`.
-3. Edit the config. Use an `https://` endpoint, set `TRANSPORT_PASSWORD` to a unique value of at least 12 characters, and enter that same password as the WHM custom destination password. Do not put credentials in chat.
-4. Run:
+اگر از آرشیو استفاده می‌کنید، محتویات را طوری باز کنید که ریشه پروژه دقیقاً `/root/parspack-backup` باشد.
+
+---
+
+## ۳) پیکربندی (بدون قرار دادن رمز در گیت)
+
+```bash
+cp -a config/parspack.conf.example config/parspack.conf
+chmod 600 config/parspack.conf
+chown root:root config/parspack.conf
+nano config/parspack.conf   # یا ویرایشگر دیگر
+```
+
+حداقل فیلدهای اجباری:
+
+```bash
+MODE="TEST"
+PARSPACK_ENDPOINT="https://YOUR-ENDPOINT"
+PARSPACK_ACCESS_KEY="..."
+PARSPACK_SECRET_KEY="..."
+PARSPACK_BUCKET="..."
+PARSPACK_PREFIX="cpanel"
+TRANSPORT_PASSWORD="حداقل-۱۲-کاراکتر-منحصر-به-فرد"
+LOCAL_READ_ROOTS="/backup:/var/cpanel"
+LOCAL_WRITE_ROOTS="/backup:/var/cpanel"
+```
+
+نکته‌ها:
+
+- اگر بکاپ روی `/MainBackup` است، آن را به `LOCAL_READ_ROOTS` و `LOCAL_WRITE_ROOTS` اضافه کنید:  
+  `LOCAL_READ_ROOTS="/MainBackup:/backup:/var/cpanel"`
+- `TRANSPORT_PASSWORD` همان رمزی است که در WHM برای Custom Destination وارد می‌کنید.
+- `config/parspack.conf` و `mc-config/` هرگز در گیت commit نمی‌شوند.
+- ابتدا `MODE=TEST` بگذارید تا آپلود واقعی انجام نشود.
+
+پیشنهاد بعد از تست موفق:
+
+```bash
+MODE="PRODUCTION"
+DELETE_LOCAL_AFTER_SUCCESS="1"   # اختیاری؛ بعد از تأیید مقصد
+ALLOW_REMOTE_DELETE="1"          # فقط اگر می‌خواهید retention مقصد کار کند
+REMOTE_KEEP_DAYS="7"             # امروز + ۷ روز قبل نگه داشته می‌شود (= ۸ فولدر روز)
+```
+
+---
+
+## ۴) نصب
 
 ```bash
 cd /root/parspack-backup
-chmod 700 install.sh bin/* transport/*
+perl -c transport/parspack_transport.pl    # باید: syntax OK
 ./install.sh
 ```
 
-5. Run:
+`install.sh` این کارها را می‌کند:
+
+- بررسی syntax (perl / php / bash / python)
+- ساخت پوشه‌های `logs`، `state`، `reports`، `mc-config`، ...
+- اجرای `parspackctl doctor`
+- کپی transport به:  
+  `/usr/local/cpanel/scripts/parspack_custom_transport.pl`
+- کپی صفحه WHM به:  
+  `/usr/local/cpanel/whostmgr/docroot/cgi/parspack_backup/index.php`
+- ثبت AppConfig در WHM
+
+سپس:
 
 ```bash
 ./bin/parspackctl doctor
 ./bin/parspackctl connection-test
 ```
 
-`retry`, `verify`, and `status` are documented in `docs/CLI.md`.
+هر دو باید بدون خطای پیکربندی تمام شوند. در `MODE=TEST` ممکن است حذف probe انجام نشود؛ مهم این است که Endpoint / TLS / Auth / Bucket سالم باشند.
 
-6. Keep `MODE=TEST`.
-7. Configure cPanel WHM Backup Configuration with a Custom destination using the installed transport script. Do not enable deletion until successful end-to-end tests are complete.
+---
 
-## Important
+## ۵) تنظیم Backup Destination در WHM
 
-The cPanel custom transport interface is the production integration point. cPanel's own documentation states the transport script **must implement** `put`, `get`, `ls`, `mkdir`, `chdir`, `rmdir`, and `delete` — if any of these hard-fail, cPanel can treat the whole destination as broken before a backup ever reaches `put`. All seven are implemented (`put` via `bin/engine-upload.sh`, the rest via `bin/remote-ops.sh`). The transport refuses to run until `PASSWORD` matches `TRANSPORT_PASSWORD`.
+1. وارد **WHM → Backup → Backup Configuration** شوید.
+2. بخش **Additional Destinations** را باز کنید.
+3. نوع را **Custom** بگذارید.
+4. مقادیر پیشنهادی:
 
-`PARSPACK_PREFIX` is the root for every command. A WHM remote directory of `weekly` and a prefix of `cpanel` stores objects at `bucket/cpanel/weekly/...`. `delete` and `rmdir` refuse to run unless `MODE=PRODUCTION` and `ALLOW_REMOTE_DELETE=1`. Even then the path must be a real `YYYY-MM-DD` folder under that prefix. They refuse an empty prefix, the bucket root, `..`, a non-date name, today's folder, and the newest verified day. The only exception is cPanel's own validation object, whose name matches `validate.tmp-<pid>-<timestamp>.txt`: that temporary object can be removed while `MODE=TEST` and `ALLOW_REMOTE_DELETE=0`.
+| فیلد | مقدار |
+|---|---|
+| Destination Name | مثلاً `PARSPACK` |
+| Script | `/usr/local/cpanel/scripts/parspack_custom_transport.pl` |
+| Backup Directory | مثلاً `daily` یا خالی (زیر `PARSPACK_PREFIX`) |
+| Host / User | می‌تواند placeholder باشد؛ پلاگین از conf می‌خواند |
+| Password | **همان** `TRANSPORT_PASSWORD` |
 
-`get` can write only under `LOCAL_WRITE_ROOTS` (and the local directory cPanel passed, when that directory itself is root-owned and private). `put` can read only under `LOCAL_READ_ROOTS` with the same ownership rule.
+5. **Validate Destination** را بزنید. باید موفق شود (فایل `validate.tmp-...` موقتی ساخته و حذف می‌شود).
+6. مقصد را Enable کنید و یک Backup دستی/زمان‌بندی‌شده اجرا کنید.
 
-Do not place the project archive, credentials, or `mc-config` inside `/backup`. Uninstall removes the generated `mc-config` credentials. `config/parspack.conf` is kept until you delete it.
+صفحه پلاگین در WHM:
 
-## Reporting
+**WHM → Plugins → PARSPACK Backup**  
+(یا مسیر CGI: `/cgi/parspack_backup/index.php`)
 
-`bin/report.py` (see `cron/report.cron`) writes a daily HTML report under `reports/` and a JSON summary under `state/history/`. Both are mode `600`. If `SMTP_ENABLED="1"`, `SMTP_TLS="1"`, and `SMTP_HOST`/`REPORT_TO` are set, it emails that report over STARTTLS with certificate checking. `NOTIFY_ON_SUCCESS` and `NOTIFY_ON_FAILURE` choose whether a successful day (including a warning) or a failed day is mailed. Cleartext SMTP is refused. A failed send is logged to stderr and never blocks report generation. The WHM settings tab writes only these mail keys.
+تب‌ها: **پیشخوان**، **گزارش‌ها**، **تنظیمات**.
 
-## File-age / stability safety check
+---
 
-`MIN_FILE_AGE_MINUTES` is not a hard refusal. cPanel calls `put` as soon as the archive is closed, so the file is almost always younger than that limit. `bin/engine-upload.sh` watches the size for `STABILITY_CHECK_SECONDS` instead. A stable size continues into the upload. If the size changes, that watch repeats up to `RETRY_COUNT` times and then that file stops. The upload command has the same limit: `RETRY_COUNT` tries, then stop. One file's failure does not cancel the other accounts, and nothing schedules an endless catch-up. Empty files are refused. A cPanel validation file under `/var/cpanel/backups/tmp.test.*` skips the age and stability wait; every other file still goes through it. After a successful upload the remote size must match. If `mc stat` reports a comparable SHA256, it must match too. A multipart checksum, such as a base64 value with a part-count suffix, is not treated as a whole-file hash; the engine hashes the remote content instead. `DELETE_LOCAL_AFTER_SUCCESS=1` removes the local file only in `PRODUCTION`, and only after that verification succeeds. A failed verification does not delete the local file or the remote object.
+## ۶) جریان عادی بعد از نیمه‌شب
+
+1. cPanel بکاپ محلی را می‌سازد (`accounts/` و `system/`).
+2. برای هر حساب، `put` از طریق transport صدا زده می‌شود.
+3. حساب‌ها به مقصد می‌روند؛ بعد از بسته شدن مجموعه، `system` و سپس `manifest.json` ارسال می‌شوند.
+4. در `PRODUCTION` اگر `ALLOW_REMOTE_DELETE=1` و `REMOTE_KEEP_DAYS>0` باشد، بعد از موفقیت روز، فولدرهای قدیمی‌تر از پنجره نگهداری حذف می‌شوند.
+5. گزارش HTML/ایمیل و وضعیت در پیشخوان به‌روز می‌شود.
+
+اگر روز `CRITICAL` شد (معمولاً `system-pending` مانده):
+
+```bash
+cd /root/parspack-backup
+ls -la state/system-pending-*
+# از WHM: ارسال مانده‌ها
+# یا:
+bin/send-remaining.sh
+```
+
+---
+
+## ۷) بررسی سلامت
+
+```bash
+cd /root/parspack-backup
+
+# وضعیت روز
+python3 bin/report.py dashboard
+
+# گزارش یک روز مشخص
+python3 bin/report.py 2026-10-14
+
+# پیش‌نمایش retention (حذف نمی‌کند)
+bin/parspackctl retention --dry-run
+
+# لاگ
+tail -n 100 logs/backup.log
+tail -n 50 logs/send-system.log
+```
+
+مقصد:
+
+```bash
+. config/parspack.conf
+mc --config-dir "$MC_CONFIG_DIR" ls \
+  "${MC_ALIAS}/${PARSPACK_BUCKET}/${PARSPACK_PREFIX}/"
+```
+
+---
+
+## ۸) ارتقا به نسخه جدید
+
+```bash
+cd /root/parspack-backup
+# بکاپ از conf و state را نگه دارید؛ install آن‌ها را بازنویسی نمی‌کند
+git fetch --tags
+git checkout v1.0   # یا نسخه جدیدتر
+chmod 700 install.sh bin/* transport/*
+./install.sh
+./bin/parspackctl doctor
+```
+
+---
+
+## ۹) حذف نصب
+
+```bash
+cd /root/parspack-backup
+./uninstall.sh
+```
+
+`uninstall.sh` transport و ثبت WHM را برمی‌دارد. `config/parspack.conf` را معمولاً نگه می‌دارد تا خودتان حذف کنید. `mc-config` ممکن است پاک شود؛ قبل از uninstall از کلیدها پشتیبان بگیرید اگر لازم است.
+
+---
+
+## ۱۰) امنیت و چیزهایی که نباید در گیت باشد
+
+| مسیر | وضعیت |
+|---|---|
+| `config/parspack.conf` | خصوصی — در `.gitignore` |
+| `mc-config/` | خصوصی — در `.gitignore` |
+| `state/`، `logs/`، `reports/` | خصوصی — در `.gitignore` |
+| `config/parspack.conf.example` | عمومی — فقط مقدار نمونه `CHANGE_ME` |
+
+هیچ Access Key / Secret / رمز واقعی را در issue، README یا commit نگذارید.
+
+---
+
+## عیب‌یابی کوتاه
+
+| مشکل | اقدام |
+|---|---|
+| `install.sh` مسیر را رد می‌کند | باید دقیقاً `/root/parspack-backup` باشد |
+| Validate در WHM شکست می‌خورد | `TRANSPORT_PASSWORD` و رمز Destination یکی نیست؛ یا `doctor`/`connection-test` را ببینید |
+| `MODE=TEST` و بکاپ «موفق» محلی پاک می‌شود؟ | در TEST آپلود واقعی نیست و engine با کد ۳ خارج می‌شود تا cPanel آن را بکاپ ذخیره‌شده حساب نکند |
+| وضعیت بحرانی با حساب‌های کامل | پوشه `system`/`manifest` تمام نشده؛ `send-remaining` یا لاگ `send-system` |
+| retention روزها را پاک نمی‌کند | `ALLOW_REMOTE_DELETE=1`، `MODE=PRODUCTION`، `REMOTE_KEEP_DAYS>0`، و روز باید کامل شده باشد؛ اول `retention --dry-run` |
+| باکت versioned و فولدر خالی می‌ماند | `remote-ops.sh` نسخه‌دار حذف می‌کند؛ در صورت نیاز دستی با `mc rm --versions` |
+
+جزئیات بیشتر: `README.md`، `docs/CLI.md`، `docs/WHM_UI.md`، `docs/CPANEL_COMPLIANCE.md`.
