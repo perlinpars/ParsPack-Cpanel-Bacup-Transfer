@@ -207,9 +207,11 @@ sub spawn_system_mirror {
             mkdir "$ROOT/logs", 0700;
             open STDOUT, '>>', "$ROOT/logs/send-system.log" or do { print $write_fh "stdout\n"; exit 1 };
             open STDERR, '>&', \*STDOUT or do { print $write_fh "stderr\n"; exit 1 };
-            exec '/bin/bash', "$ROOT/bin/send-system.sh", '--run', $local, $remote;
-            print $write_fh "exec failed\n";
-            exit 1;
+            exec '/bin/bash', "$ROOT/bin/send-system.sh", '--run', $local, $remote
+                or do {
+                    print $write_fh "exec failed\n";
+                    exit 1;
+                };
         }
         close $write_fh;
         my $err = '';
@@ -298,10 +300,20 @@ if ($cmd eq 'put') {
         $code = $status >> 8;
     }
     if ($code == 0) {
-        my $mirror = spawn_system_mirror($canonical, $remote);
-        if ($mirror eq 'marker-failed') {
-            note_mirror('system pending marker could not be written; put failed closed');
-            exit 1;
+        my $day = backup_day($canonical);
+        my $needed = '1';
+        if ($day ne '') {
+            my $flag = eval { py_stdout('mirror-needed', '--', $day) };
+            $needed = defined $flag ? $flag : '1';
+        }
+        if ($needed eq '0') {
+            note_mirror("system mirror skipped for $day; day is already partial or complete");
+        } else {
+            my $mirror = spawn_system_mirror($canonical, $remote);
+            if ($mirror eq 'marker-failed') {
+                note_mirror('system pending marker could not be written; put failed closed');
+                exit 1;
+            }
         }
     }
     exit $code;

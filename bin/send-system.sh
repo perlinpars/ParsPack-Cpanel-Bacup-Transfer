@@ -166,11 +166,26 @@ deadline=$(( $(date +%s) + ${SYSTEM_DEADLINE_SECONDS:-21600} ))
 previous_set=""
 stable_since=0
 gate="waiting"
+complete_mode=0
 if [[ "${1:-}" == "--complete" ]]; then
+  complete_mode=1
   # Same gate as the detached mirror, without waiting. A day that is not
   # already terminal stays pending and the marker is not removed.
+  # When local account tars were deleted after success, rebuild the name
+  # list from the state DB so finalize (manifest) can still run.
   names=""
   account_names <<< "$(account_set || true)"
+  if [[ -z "$names" ]]; then
+    set +e
+    names="$(pp_state verified-names --date "$day_name")"
+    names_rc=$?
+    set -e
+    if [[ "$names_rc" -ne 0 || -z "$names" ]]; then
+      pp_log ERROR "no local accounts and no verified account rows in state for $day_name; marker kept"
+      exit 1
+    fi
+    pp_log INFO "using verified account names from state for finalize ($day_name)"
+  fi
   now="$(date +%s)"
   set +e
   gate="$(pp_state accounts-ready --date "$day_name" --names "$names" --set-stable 1 --now "$now" --deadline "$((now + 10))")"
@@ -204,7 +219,27 @@ while (( $(date +%s) < deadline )); do
   gate="$(pp_state accounts-ready --date "$day_name" --names "$names" --set-stable "$set_stable" --now "$now" --deadline "$deadline")"
   gate_rc=$?
   set -e
+  # When local tars are gone (DELETE_LOCAL_AFTER_SUCCESS), close the day from
+  # DB: all account rows terminal + idle for SYSTEM_SET_STABLE_SECONDS.
+  if [[ "$gate" != "ready" && -z "$names" ]]; then
+    set +e
+    day_gate="$(pp_state accounts-day-gate --date "$day_name" --idle "$stable_for" --now "$now" --deadline "$deadline")"
+    day_rc=$?
+    set -e
+    day_status="${day_gate%%$'\t'*}"
+    day_names="${day_gate#*$'\t'}"
+    if [[ "$day_rc" -eq 0 && "$day_status" == "ready" && -n "$day_names" ]]; then
+      gate="ready"
+      names="$day_names"
+      pp_log INFO "local account tars are gone; finalizing from idle verified state for $day_name"
+    elif [[ "$day_status" == "partial" ]]; then
+      gate="partial"
+    fi
+  fi
   if [[ "$gate_rc" -eq 0 && "$gate" == "ready" ]]; then
+    break
+  fi
+  if [[ "$gate" == "ready" ]]; then
     break
   fi
   if [[ "$gate" == "partial" ]]; then
@@ -213,19 +248,36 @@ while (( $(date +%s) < deadline )); do
   sleep 15
 done
 if [[ "$gate" != "ready" ]]; then
+  now="$(date +%s)"
+  set +e
+  day_gate="$(pp_state accounts-day-gate --date "$day_name" --idle 0 --now "$now" --deadline "$((now + 10))")"
+  day_rc=$?
+  set -e
+  day_status="${day_gate%%$'\t'*}"
+  day_names="${day_gate#*$'\t'}"
+  if [[ "$day_rc" -eq 0 && "$day_status" == "ready" && -n "$day_names" ]]; then
+    gate="ready"
+    names="$day_names"
+    pp_log INFO "finalizing from verified state rows for $day_name"
+  fi
+fi
+if [[ "$gate" != "ready" ]]; then
   gate="partial"
   pp_state set-run --date "$day_name" --state partial || true
   pp_log ERROR "system mirror deadline reached before every expected account was terminal; day $day_name is partial and manifest.json will not be uploaded"
 fi
 fi
 
-if [[ "$gate" == "partial" && ! -d "$system_dir" ]]; then
+# Partial means accounts are still incomplete. Do not upload system/ here:
+# that would compete with cPanel account puts on upload.lock. Keep the
+# marker and leave system for send-remaining after accounts finish.
+if [[ "$gate" == "partial" ]]; then
+  pp_state set-run --date "$day_name" --state partial || true
+  pp_log ERROR "day $day_name is partial; system files were not uploaded so account transfers are not blocked; marker kept and manifest.json was not uploaded"
   send_report 0
 fi
 
-if [[ "$gate" == "ready" ]]; then
-  pp_state set-run --date "$day_name" --state system_running || true
-fi
+pp_state set-run --date "$day_name" --state system_running || true
 "$ROOT/bin/engine-upload.sh" --due || true
 
 sent=0
@@ -271,6 +323,7 @@ while IFS= read -r -d '' file; do
     if lock_free; then
       break
     fi
+    pp_log WARN "system mirror waiting for upload.lock before retrying $remote"
     sleep 30
     attempt=$((attempt + 1))
   done
@@ -284,16 +337,25 @@ done < <(find -P "$system_dir" -type f -print0)
 fi
 
 pp_log INFO "system mirror finished sent=$sent failed=$failed skipped=$skipped gate=$gate"
-if [[ "$gate" == "partial" ]]; then
-  pp_state set-run --date "$day_name" --state partial || true
-  pp_log ERROR "system mirror left day $day_name partial; marker kept and manifest.json was not uploaded"
-  send_report 0
-fi
-if (( failed > 0 || sent + skipped == 0 )); then
-  if (( sent + skipped == 0 )); then
-    pp_log ERROR "system mirror verified no files; marker kept for $day_name"
-  fi
+if (( failed > 0 )); then
   send_report 1
+fi
+if (( sent + skipped == 0 )); then
+  # Finalize after send-remaining may find an empty local system/ because
+  # verified files were already deleted. Allow manifest when state already
+  # recorded successful system uploads for this day.
+  system_ok=0
+  if (( complete_mode == 1 )); then
+    set +e
+    system_ok="$(pp_state system-success-count --date "$day_name")"
+    set -e
+  fi
+  if (( complete_mode == 1 && system_ok > 0 )); then
+    pp_log INFO "local system empty; $system_ok system file(s) already verified in state for $day_name"
+  else
+    pp_log ERROR "system mirror verified no files; marker kept for $day_name"
+    send_report 1
+  fi
 fi
 
 plugin_version="unknown"
@@ -318,5 +380,22 @@ fi
 pp_state set-run --date "$day_name" --state complete || true
 if ! clear_pending_marker; then
   send_report 1
+fi
+if [[ "${MODE:-}" == "PRODUCTION" && "${ALLOW_REMOTE_DELETE:-}" == "1" && "${REMOTE_KEEP_DAYS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+  pp_log INFO "Applying remote keep window of $REMOTE_KEEP_DAYS days"
+  set +e
+  "$ROOT/bin/parspackctl" retention --apply
+  keep_rc=$?
+  set -e
+  if [[ "$keep_rc" -ne 0 ]]; then
+    pp_log ERROR "Remote keep window did not finish"
+    # Report builder elevates OK→WARNING while this marker exists.
+    printf 'day=%s\n' "$day_name" > "$STATE_DIR/retention-failed-$day_name.tmp"
+    chmod 600 "$STATE_DIR/retention-failed-$day_name.tmp"
+    mv -f -- "$STATE_DIR/retention-failed-$day_name.tmp" "$STATE_DIR/retention-failed-$day_name"
+    chmod 600 "$STATE_DIR/retention-failed-$day_name"
+  else
+    rm -f -- "$STATE_DIR/retention-failed-$day_name"
+  fi
 fi
 send_report 0

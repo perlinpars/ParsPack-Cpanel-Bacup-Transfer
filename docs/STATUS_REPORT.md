@@ -146,7 +146,7 @@ Unchanged in intent. Run on a staging host with a disposable prefix. Keep both d
 | --- | --- | --- |
 | 0 | On the server, before `install.sh`: `perl -c /root/parspack-backup/transport/parspack_transport.pl` and confirm `perl` is `/usr/bin/perl` | `syntax OK`, exit 0. If this fails, do not install. `install.sh` repeats the check and will not replace the live transport. |
 | 1 | `MODE=TEST`, `parspackctl doctor` | Warnings only; no upload |
-| 2 | WHM Validate | Probe object; backup `put` exits 3 |
+| 2 | WHM Validate while `MODE=TEST` | The probe object is uploaded and `put` exits 0. A real backup `put` still exits 3 and stores nothing |
 | 3 | `MODE=PRODUCTION`, both delete flags 0, one account | Object under `prefix/YYYY-MM-DD/accounts/`; marker appears and clears after the mirror |
 | 4 | Hold `upload.lock` | Second put waits, then a clear timeout message |
 | 5 | Kill -9 during `mc put` | Row returns to FAILED; retry verifies |

@@ -465,7 +465,7 @@ def _mc_version(mc_bin):
     return line[0][:80] if line else ""
 
 
-def _default_mc(conf, args):
+def _default_mc(conf, args, timeout=60):
     env = os.environ.copy()
     for key in ("PASSWORD", "SMTP_PASSWORD", "TRANSPORT_PASSWORD", "PARSPACK_ACCESS_KEY", "PARSPACK_SECRET_KEY"):
         env.pop(key, None)
@@ -476,7 +476,7 @@ def _default_mc(conf, args):
         stderr=subprocess.PIPE,
         env=env,
         universal_newlines=True,
-        timeout=60,
+        timeout=timeout,
         check=False,
     )
     return proc.returncode, proc.stdout or "", proc.stderr or ""

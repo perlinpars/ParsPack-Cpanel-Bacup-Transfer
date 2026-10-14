@@ -24,6 +24,8 @@ import sys
 import tempfile
 import urllib.parse
 
+import parspack_state
+
 ROOT = os.path.realpath(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 CONF_PATH = os.path.join(ROOT, "config", "parspack.conf")
 
@@ -43,12 +45,14 @@ SHELL_KEYS = (
     "MIN_FILE_AGE_MINUTES",
     "STABILITY_CHECK_SECONDS",
     "UPLOAD_LOCK_WAIT_SECONDS",
+    "SYSTEM_UPLOAD_LOCK_WAIT_SECONDS",
     "DELETE_LOCAL_DELAY",
     "SYSTEM_SET_STABLE_SECONDS",
     "SYSTEM_DEADLINE_SECONDS",
     "REMOTE_EXISTS_POLICY",
     "DELETE_LOCAL_AFTER_SUCCESS",
     "ALLOW_REMOTE_DELETE",
+    "REMOTE_KEEP_DAYS",
     "LOG_DIR",
     "STATE_DIR",
     "REPORT_DIR",
@@ -387,12 +391,14 @@ def validate_core(raw):
         "MIN_FILE_AGE_MINUTES": "15",
         "STABILITY_CHECK_SECONDS": "60",
         "UPLOAD_LOCK_WAIT_SECONDS": "120",
+        "SYSTEM_UPLOAD_LOCK_WAIT_SECONDS": "600",
         "DELETE_LOCAL_DELAY": "0",
         "SYSTEM_SET_STABLE_SECONDS": "120",
         "SYSTEM_DEADLINE_SECONDS": "21600",
         "REMOTE_EXISTS_POLICY": "VERIFY",
         "DELETE_LOCAL_AFTER_SUCCESS": "0",
         "ALLOW_REMOTE_DELETE": "0",
+        "REMOTE_KEEP_DAYS": "0",
         "LOCAL_READ_ROOTS": "/backup:/var/cpanel",
         "LOCAL_WRITE_ROOTS": "/backup:/var/cpanel",
     }
@@ -412,8 +418,10 @@ def validate_core(raw):
         ("MIN_FILE_AGE_MINUTES", 0, 1440),
         ("STABILITY_CHECK_SECONDS", 0, 600),
         ("UPLOAD_LOCK_WAIT_SECONDS", 1, 240),
+        ("SYSTEM_UPLOAD_LOCK_WAIT_SECONDS", 1, 3600),
         ("SYSTEM_SET_STABLE_SECONDS", 0, 3600),
         ("SYSTEM_DEADLINE_SECONDS", 60, 86400),
+        ("REMOTE_KEEP_DAYS", 0, 3650),
     )
     for key, low, high in number_rules:
         parsed = parse_int(raw.get(key, ""), low, high, key, errors)
@@ -523,6 +531,9 @@ MAIL_UPDATE_KEYS = (
 )
 
 SETTINGS_KEYS = MAIL_UPDATE_KEYS + (
+    "ALLOW_REMOTE_DELETE",
+    "REMOTE_KEEP_DAYS",
+    "DELETE_LOCAL_AFTER_SUCCESS",
     "ALERT_REMOTE_BYTES",
     "WEBHOOK_ENABLED",
     "WEBHOOK_URL",
@@ -641,6 +652,9 @@ def mail_settings_view(raw):
         "access_key": "Configured" if raw.get("PARSPACK_ACCESS_KEY") else "Missing",
         "secret_key": "Configured" if raw.get("PARSPACK_SECRET_KEY") else "Missing",
         "transport_password": "Configured" if raw.get("TRANSPORT_PASSWORD") else "Missing",
+        "allow_remote_delete": "1" if raw.get("ALLOW_REMOTE_DELETE") == "1" else "0",
+        "remote_keep_days": raw.get("REMOTE_KEEP_DAYS", "") or "0",
+        "delete_local_after_success": "1" if raw.get("DELETE_LOCAL_AFTER_SUCCESS") == "1" else "0",
     }
 
 
@@ -790,6 +804,15 @@ def update_settings(payload):
         raise ConfigError("configuration file is missing")
     current = load_config_file()
     updates = {
+        "ALLOW_REMOTE_DELETE": _mail_flag(data, current, "ALLOW_REMOTE_DELETE", "0"),
+        "REMOTE_KEEP_DAYS": _optional_text(
+            data,
+            current,
+            "REMOTE_KEEP_DAYS",
+            lambda value: bool(re.fullmatch(r"0|[1-9][0-9]{0,3}", value) and int(value) <= 3650),
+            "REMOTE_KEEP_DAYS",
+        ) or "0",
+        "DELETE_LOCAL_AFTER_SUCCESS": _mail_flag(data, current, "DELETE_LOCAL_AFTER_SUCCESS", "0"),
         "SMTP_ENABLED": _mail_flag(data, current, "SMTP_ENABLED", "0"),
         "NOTIFY_ON_SUCCESS": _mail_flag(data, current, "NOTIFY_ON_SUCCESS", "1"),
         "NOTIFY_ON_FAILURE": _mail_flag(data, current, "NOTIFY_ON_FAILURE", "1"),
@@ -1247,14 +1270,38 @@ def tighten_file(path, conf):
         os.close(fd)
 
 
+STORAGE_FULL_MARKERS = (
+    "quota",
+    "disk full",
+    "nospace",
+    "no space",
+    "insufficient",
+    "storagereached",
+    "storage limit",
+    "xminiostoragefull",
+    "bucketisfull",
+    "bucket full",
+    "entitytoobig",
+    "capacity",
+)
+
+
+def is_storage_full_error(text):
+    """True when the transport error means the destination has no room."""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in STORAGE_FULL_MARKERS)
+
+
 def classify_transport_error(text):
     """Map an mc/S3 error to FATAL or RETRYABLE.
 
     Unknown transport text stays RETRYABLE so a transient message we do not
-    recognize still uses the existing attempt limit. Permission and bucket
-    errors stop on the first attempt.
+    recognize still uses the existing attempt limit. Permission, bucket, and
+    storage-full errors stop on the first attempt.
     """
     lowered = (text or "").lower()
+    if is_storage_full_error(lowered):
+        return "FATAL"
     fatal_markers = (
         "403",
         "accessdenied",
@@ -1323,6 +1370,16 @@ def decide_upload(mode, policy, exists, local_size, remote_size, local_sha, remo
         return "skip"
     if effective == "VERIFY" and size_match and not hash_present:
         return "verify-content"
+    # Same size with a wrong checksum: replace that one object in PRODUCTION.
+    # Different sizes still fail unless REPLACE is set.
+    if (
+        effective == "VERIFY"
+        and mode == "PRODUCTION"
+        and size_match
+        and hash_present
+        and not hash_match
+    ):
+        return "reupload"
     if effective == "SKIP" and size_match and not hash_present:
         return "skip-legacy"
     return "fail"
@@ -1669,6 +1726,51 @@ def pending_system_days(state_dir):
     return sorted(days)
 
 
+def retention_failed_days(state_dir):
+    """Dates where remote keep-window prune was attempted and did not finish."""
+    if not state_dir or os.path.islink(state_dir) or not os.path.isdir(state_dir):
+        return []
+    days = []
+    for name in os.listdir(state_dir):
+        match = re.fullmatch(r"retention-failed-(\d{4}-\d{2}-\d{2})", name)
+        if match is None:
+            continue
+        path = os.path.join(state_dir, name)
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        days.append(match.group(1))
+    return sorted(days)
+
+
+def retention_failed_marker(state_dir, day):
+    return os.path.join(state_dir, "retention-failed-%s" % day)
+
+
+def write_retention_failed_marker(state_dir, day):
+    """Mark that age prune failed after a verified system day. Mode 0600."""
+    if not DATE_SEGMENT_RE.fullmatch(day or ""):
+        raise ConfigError("backup date must look like YYYY-MM-DD")
+    ensure_private_dir(state_dir)
+    path = retention_failed_marker(state_dir, day)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write("day=%s\n" % day)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return path
+
+
+def clear_retention_failed_marker(state_dir, day):
+    if not DATE_SEGMENT_RE.fullmatch(day or ""):
+        return False
+    path = retention_failed_marker(state_dir, day)
+    if os.path.islink(path) or not os.path.isfile(path):
+        return False
+    os.remove(path)
+    return True
+
+
 def doctor():
     require_root()
     raw = load_config_file()
@@ -1738,6 +1840,7 @@ def show_config():
         ("OVERWRITE", "allowed" if overwrite else "disabled"),
         ("LOCAL_DELETE", "allowed" if local_delete else "disabled"),
         ("REMOTE_DELETE", "allowed" if remote_delete else "disabled"),
+        ("REMOTE_KEEP_DAYS", conf["REMOTE_KEEP_DAYS"]),
         ("TRANSPORT_TRACE", "on" if conf["TRANSPORT_TRACE"] == "1" else "off"),
         ("TRANSPORT_AUTH", "disabled" if conf["TRANSPORT_AUTH_DISABLED"] == "1" else "required"),
         ("LOCAL_READ_ROOTS", conf["LOCAL_READ_ROOTS"]),
@@ -1922,6 +2025,26 @@ def dispatch(argv):
             raise ConfigError("decide expects 7 arguments")
         sys.stdout.write(decide_upload(*args) + "\n")
         return 0
+    if command == "mirror-needed":
+        require_root()
+        day = take_operand(args)
+        if not DATE_SEGMENT_RE.fullmatch(day or ""):
+            raise ConfigError("backup date must look like YYYY-MM-DD")
+        conf = load_valid()
+        conn = parspack_state.connect(os.path.join(conf["STATE_DIR"], "parspack.db"))
+        try:
+            row = conn.execute(
+                "SELECT run_state FROM backup_days WHERE backup_date = ?",
+                (day,),
+            ).fetchone()
+        finally:
+            conn.close()
+        state = (row["run_state"] if row else "") or ""
+        # partial/complete: do not detach another send-system from account puts.
+        # open/system_running/missing: a mirror may still be needed.
+        needed = "0" if state in ("partial", "complete") else "1"
+        sys.stdout.write(needed + "\n")
+        return 0
     if command == "exact-stat":
         sys.stdout.write(exact_stat_line(sys.stdin.read(), take_operand(args)) + "\n")
         return 0
@@ -1947,6 +2070,8 @@ def dispatch(argv):
     if command == "classify-error":
         sys.stdout.write(classify_transport_error(sys.stdin.read()) + "\n")
         return 0
+    if command == "storage-full":
+        return 0 if is_storage_full_error(sys.stdin.read()) else 1
     if command in ("retention-check", "retention-confirm", "retention-log"):
         require_root()
         import parspack_retention
@@ -2023,6 +2148,9 @@ def self_test():
     assert classify_transport_error("NoSuchBucket") == "FATAL"
     assert classify_transport_error("403 AccessDenied") == "FATAL"
     assert classify_transport_error("InvalidAccessKeyId") == "FATAL"
+    assert classify_transport_error("XMinioStorageFull") == "FATAL"
+    assert classify_transport_error("QuotaExceeded: disk full") == "FATAL"
+    assert is_storage_full_error("XMinioStorageFull: Please reduce your disk usage")
     assert classify_transport_error("connection reset by peer") == "RETRYABLE"
     assert classify_transport_error("429 SlowDown") == "RETRYABLE"
     assert classify_transport_error("503 Service Unavailable") == "RETRYABLE"
@@ -2060,6 +2188,11 @@ def self_test():
             handle.write("no\n")
         assert pending_system_days(pending_dir) == ["2026-10-08"]
         assert pending_system_days(os.path.join(pending_dir, "missing")) == []
+        with open(os.path.join(pending_dir, "retention-failed-2026-10-09"), "w", encoding="utf-8") as handle:
+            handle.write("day=2026-10-09\n")
+        assert retention_failed_days(pending_dir) == ["2026-10-09"]
+        assert clear_retention_failed_marker(pending_dir, "2026-10-09")
+        assert retention_failed_days(pending_dir) == []
     finally:
         shutil.rmtree(pending_dir)
     assert sanitize_remote("/", allow_empty=True) == ""
@@ -2092,7 +2225,8 @@ def self_test():
     assert decide_upload("PRODUCTION", "VERIFY", "0", "10", "-", digest, "-") == "upload"
     assert decide_upload("PRODUCTION", "VERIFY", "1", "10", "10", digest, digest) == "skip"
     assert decide_upload("PRODUCTION", "VERIFY", "1", "10", "11", digest, digest) == "fail"
-    assert decide_upload("PRODUCTION", "VERIFY", "1", "10", "10", digest, "b" * 64) == "fail"
+    assert decide_upload("PRODUCTION", "VERIFY", "1", "10", "10", digest, "b" * 64) == "reupload"
+    assert decide_upload("TEST", "VERIFY", "1", "10", "10", digest, "b" * 64) == "fail"
     assert decide_upload("PRODUCTION", "VERIFY", "1", "10", "10", digest, "-") == "verify-content"
     assert decide_upload("PRODUCTION", "SKIP", "1", "10", "10", digest, "-") == "skip-legacy"
     assert decide_upload("PRODUCTION", "REPLACE", "1", "10", "11", digest, "-") == "upload"

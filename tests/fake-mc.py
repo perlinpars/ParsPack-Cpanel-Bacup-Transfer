@@ -83,7 +83,11 @@ def describe_file(path, name):
     if mode == "partial":
         size = max(0, size - 1)
     payload["size"] = size
-    if mode == "etag-only":
+    # After a server-side copy, real S3 often keeps size but drops put SHA256
+    # and shows an ETag that is not the original multipart layout.
+    if mode == "publish-etag-skew" and not path.endswith(".uploading"):
+        payload["etag"] = "0" * 32
+    elif mode == "etag-only":
         payload["etag"] = hashlib.md5(raw).hexdigest()
     else:
         payload["checksum"] = {"SHA256": encoded}
@@ -161,6 +165,19 @@ elif command == "stat":
     if not os.path.isfile(path):
         missing()
     sys.stdout.write(json.dumps(describe_file(path, os.path.basename(path))) + "\n")
+    sys.exit(0)
+elif command == "du":
+    path = location(positional[0]) if positional else store
+    total = 0
+    if os.path.isdir(path):
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.isfile(full):
+                    total += os.path.getsize(full)
+    elif os.path.isfile(path):
+        total = os.path.getsize(path)
+    sys.stdout.write(json.dumps({"size": total}) + "\n")
     sys.exit(0)
 elif command == "ls":
     target = positional[0]

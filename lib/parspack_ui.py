@@ -12,6 +12,7 @@ import json
 import os
 import re
 import ssl
+import subprocess
 import sys
 import time
 import urllib.request
@@ -22,10 +23,227 @@ import parspack_config  # noqa: E402
 
 USER_RE = re.compile(r"\A[A-Za-z0-9._-]{1,32}\Z")
 ACCOUNT_RE = re.compile(r"\A[A-Za-z0-9._+-]{1,64}\Z")
+DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 DEDUPE_SECONDS = 12 * 3600
 RATE_LIMIT = 8
 RATE_WINDOW = 60
+
+_REASON_FA = (
+    ("Destination storage is full", "فضای مقصد پر است"),
+    ("storage is full", "فضای مقصد پر است"),
+    ("Copied object failed verification", "بعد از کپی به نام نهایی، تأیید مقصد ناموفق بود"),
+    ("Remote metadata verification mismatch", "متادیتای مقصد با فایل محلی جور نبود"),
+    ("Remote content checksum mismatch", "checksum محتوای مقصد با فایل محلی یکی نبود"),
+    ("Remote size mismatch", "اندازه فایل در مقصد با مبدأ یکی نبود"),
+    ("Could not verify remote object content", "خواندن محتوا از مقصد برای تأیید ممکن نشد"),
+    ("Upload failed after", "آپلود بعد از چند تلاش ناموفق ماند"),
+    ("Upload lock was still held", "قفل آپلود آزاد نشد و این فایل منتظر ماند"),
+    ("system mirror failed", "ارسال فایل system ناموفق بود"),
+    ("remote content did not match", "محتوای مقصد با فایل محلی یکی نبود"),
+    ("Temporary upload failed verification", "فایل موقت آپلود تأیید نشد و حذف شد"),
+    ("Verified temporary object could not be copied", "کپی از فایل موقت تأییدشده به نام نهایی انجام نشد"),
+)
+
+
+def reason_fa(message):
+    text = (message or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    for needle, persian in _REASON_FA:
+        if needle.lower() in lowered:
+            return persian
+    return text
+
+
+STORAGE_CACHE_SECONDS = 300
+
+
+def local_disk_usage(roots):
+    """Filesystem total/used/free for the first readable LOCAL_READ_ROOT."""
+    for root in roots or []:
+        if not root or os.path.islink(root) or not os.path.isdir(root):
+            continue
+        try:
+            st = os.statvfs(root)
+        except OSError:
+            continue
+        total = int(st.f_frsize) * int(st.f_blocks)
+        free = int(st.f_frsize) * int(st.f_bavail)
+        if total <= 0:
+            continue
+        used = total - free
+        if used < 0:
+            used = 0
+        return {
+            "path": root,
+            "total": total,
+            "used": used,
+            "free": free,
+            "ok": True,
+        }
+    return {"path": "", "total": 0, "used": 0, "free": 0, "ok": False}
+
+
+def day_local_bytes(roots, day):
+    """Sum regular files under <root>/<day> without following symlinks."""
+    if not day or not DATE_RE.fullmatch(day):
+        return 0
+    total = 0
+    for root in roots or []:
+        day_dir = os.path.join(root, day)
+        if os.path.islink(day_dir) or not os.path.isdir(day_dir):
+            continue
+        for dirpath, dirnames, filenames in os.walk(day_dir, followlinks=False):
+            dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                try:
+                    total += int(os.path.getsize(path))
+                except OSError:
+                    continue
+        break
+    return total
+
+
+def recorded_remote_bytes(conn):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(size), 0) AS n FROM uploads "
+        "WHERE status IN ('VERIFIED','LOCAL_DELETED','LOCAL_CLEANUP_FAILED')"
+    ).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def _read_storage_cache(path):
+    if not path or os.path.islink(path) or not os.path.isfile(path):
+        return None
+    try:
+        data = json.loads(open(path, "r", encoding="utf-8").read() or "{}")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _write_storage_cache(path, payload):
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if not directory or os.path.islink(directory) or not os.path.isdir(directory):
+        return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def probe_remote_used(conf, cache_path, now=None):
+    """Best-effort prefix usage via mc du. Cached; free space is usually unavailable on S3."""
+    now = int(now if now is not None else time.time())
+    cached = _read_storage_cache(cache_path) or {}
+    if (
+        cached.get("ok")
+        and isinstance(cached.get("used"), int)
+        and isinstance(cached.get("at"), int)
+        and (now - int(cached["at"])) < STORAGE_CACHE_SECONDS
+    ):
+        return {
+            "used": int(cached["used"]),
+            "free": None,
+            "ok": True,
+            "cached": True,
+            "source": "mc-du",
+        }
+    alias = conf.get("MC_ALIAS") or ""
+    bucket = conf.get("PARSPACK_BUCKET") or ""
+    prefix = (conf.get("PARSPACK_PREFIX") or "").strip("/")
+    if not alias or not bucket:
+        return {"used": 0, "free": None, "ok": False, "cached": False, "source": "none"}
+    target = "%s/%s" % (alias, bucket)
+    if prefix:
+        target = "%s/%s" % (target, prefix)
+    env = os.environ.copy()
+    for key in ("PASSWORD", "SMTP_PASSWORD", "TRANSPORT_PASSWORD", "PARSPACK_ACCESS_KEY", "PARSPACK_SECRET_KEY"):
+        env.pop(key, None)
+    env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    try:
+        proc = subprocess.run(
+            [conf["MC_BIN"], "--config-dir", conf["MC_CONFIG_DIR"], "du", "--json", target],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            universal_newlines=True,
+            timeout=12,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"used": int(cached.get("used") or 0), "free": None, "ok": False, "cached": bool(cached), "source": "mc-du"}
+    used = 0
+    ok = False
+    if proc.returncode == 0:
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line or line[0] not in "{[":
+                continue
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            rows = item if isinstance(item, list) else [item]
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for key in ("size", "Size", "totalSize", "bytes"):
+                    if key in row:
+                        try:
+                            used = max(used, int(row[key]))
+                            ok = True
+                        except (TypeError, ValueError):
+                            pass
+    if ok:
+        _write_storage_cache(cache_path, {"at": now, "used": used, "ok": True})
+        return {"used": used, "free": None, "ok": True, "cached": False, "source": "mc-du"}
+    if isinstance(cached.get("used"), int):
+        return {"used": int(cached["used"]), "free": None, "ok": True, "cached": True, "source": "mc-du"}
+    return {"used": 0, "free": None, "ok": False, "cached": False, "source": "mc-du"}
+
+
+def build_storage_view(conf, conn, day, alert_threshold=0):
+    roots = parspack_config.split_roots(conf.get("LOCAL_READ_ROOTS", ""))
+    local = local_disk_usage(roots)
+    recorded = recorded_remote_bytes(conn) if conn is not None else 0
+    remote = probe_remote_used(
+        conf,
+        os.path.join(conf.get("STATE_DIR") or "", "storage-cache.json"),
+    )
+    day_local = day_local_bytes(roots, day) if day else 0
+    threshold = int(alert_threshold or 0)
+    remote_used = int(remote["used"]) if remote.get("ok") else recorded
+    return {
+        "local": local,
+        "local_day_bytes": day_local,
+        "remote": {
+            "used": remote_used,
+            "recorded": recorded,
+            "free": remote.get("free"),
+            "ok": bool(remote.get("ok") or recorded > 0),
+            "cached": bool(remote.get("cached")),
+            "source": remote.get("source") or "recorded",
+            "threshold": threshold,
+        },
+    }
 
 
 class UiError(Exception):
@@ -70,10 +288,17 @@ def _secrets(raw):
     return [raw.get(key, "") for key in keys if raw.get(key, "")]
 
 
-def dashboard_from_db(conn, day, pending, secrets=()):
-    dates = [row["backup_date"] for row in conn.execute(
-        "SELECT backup_date FROM backup_days ORDER BY backup_date DESC"
-    )]
+def dashboard_from_db(conn, day, pending, secrets=(), retention_failed=()):
+    dates = [
+        row["backup_date"]
+        for row in conn.execute(
+            "SELECT backup_date FROM backup_days ORDER BY backup_date DESC LIMIT 10"
+        )
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", row["backup_date"] or "")
+    ]
+    # At most the newest 10 days; an older ?date= is clamped to this window.
+    if day and day not in dates:
+        day = dates[0] if dates else ""
     if not day:
         day = dates[0] if dates else ""
     counts = {}
@@ -82,6 +307,7 @@ def dashboard_from_db(conn, day, pending, secrets=()):
     levels = {"sha256": 0, "etag": 0, "size-only": 0}
     last_verified = ""
     failed = []
+    storage_full = False
     run_state = ""
     if day:
         run = conn.execute(
@@ -110,11 +336,12 @@ def dashboard_from_db(conn, day, pending, secrets=()):
             if status in ("UPLOAD_FAILED", "VERIFY_FAILED"):
                 account = row["account"] or ""
                 if account and account != "system" and ACCOUNT_RE.fullmatch(account):
+                    raw_reason = redact(row["error_message"] or row["error_class"] or "", secrets)
                     failed.append({
                         "account": account,
                         "date": day,
                         "status": status,
-                        "reason": redact(row["error_message"] or row["error_class"] or "", secrets),
+                        "reason": reason_fa(raw_reason),
                     })
     else:
         started = finished = ""
@@ -129,6 +356,20 @@ def dashboard_from_db(conn, day, pending, secrets=()):
         system = "complete"
     elif run_state:
         system = run_state
+    storage_full = False
+    if day:
+        for row in conn.execute(
+            "SELECT error_message, error_class FROM uploads WHERE backup_date = ? "
+            "AND status IN ('UPLOAD_FAILED','VERIFY_FAILED')",
+            (day,),
+        ):
+            blob = "%s %s" % (row["error_message"] or "", row["error_class"] or "")
+            lowered = blob.lower()
+            if "storage is full" in lowered or "quota" in lowered or "disk full" in lowered:
+                storage_full = True
+                break
+    retention_hit = bool(day) and day in set(retention_failed or ())
+    accounts_complete = ok > 0 and account_failed == 0
     facts = {
         "verify_failed": counts.get("VERIFY_FAILED", 0),
         "upload_failed": counts.get("UPLOAD_FAILED", 0),
@@ -138,11 +379,16 @@ def dashboard_from_db(conn, day, pending, secrets=()):
         "run_state": run_state,
         "pending": system == "pending",
         "remote_ok": True,
+        "storage_full": storage_full,
+        "retention_failed": retention_hit,
+        "accounts_ok": ok,
+        "accounts_failed": account_failed,
+        "accounts_complete": accounts_complete,
     }
     warnings = classify_alerts({"status": "OK", "remote_ok": True}, facts, 0)["warnings"]
     return {
         "date": day,
-        "dates": [item for item in dates if re.fullmatch(r"\d{4}-\d{2}-\d{2}", item)],
+        "dates": dates,
         "run_state": run_state,
         "started": started,
         "finished": finished,
@@ -166,7 +412,20 @@ def classify_alerts(snapshot, facts, threshold):
     severity = "info"
     if status == "CRITICAL" or facts.get("pending") or facts.get("run_state") == "partial":
         severity = "critical"
-        warnings.append({"severity": "critical", "text": "system backup is incomplete"})
+        if facts.get("accounts_complete") or (
+            status == "CRITICAL" and not facts.get("upload_failed")
+            and int(facts.get("accounts_failed") or 0) == 0
+            and int(facts.get("accounts_ok") or 0) > 0
+        ):
+            warnings.append({
+                "severity": "critical",
+                "text": "accounts transferred but system backup incomplete",
+            })
+        else:
+            warnings.append({"severity": "critical", "text": "system backup is incomplete"})
+    if facts.get("storage_full"):
+        severity = "critical"
+        warnings.append({"severity": "critical", "text": "destination storage is full"})
     if not snapshot.get("remote_ok", True):
         severity = "critical"
         warnings.append({"severity": "critical", "text": "remote storage was not readable"})
@@ -181,6 +440,10 @@ def classify_alerts(snapshot, facts, threshold):
         if severity == "info":
             severity = "warning"
         warnings.append({"severity": "warning", "text": "local cleanup failed"})
+    if facts.get("retention_failed"):
+        if severity == "info":
+            severity = "warning"
+        warnings.append({"severity": "warning", "text": "remote keep window did not finish"})
     remote_bytes = int(facts.get("remote_bytes") or 0)
     if threshold and remote_bytes > int(threshold):
         if severity == "info":
@@ -442,17 +705,25 @@ def main(argv=None):
             conf = parspack_config.validate_core(raw)
             db_path = os.path.join(conf["STATE_DIR"], "parspack.db")
             pending = parspack_config.pending_system_days(conf["STATE_DIR"])
+            retention_failed = parspack_config.retention_failed_days(conf["STATE_DIR"])
+            threshold = int(raw.get("ALERT_REMOTE_BYTES") or 0)
             try:
                 conn = connect_readonly(db_path)
                 view = dashboard_from_db(
-                    conn, day, ["system-pending-%s" % item for item in pending], _secrets(raw)
+                    conn,
+                    day,
+                    ["system-pending-%s" % item for item in pending],
+                    _secrets(raw),
+                    retention_failed,
                 )
+                view["storage"] = build_storage_view(conf, conn, view.get("date") or day, threshold)
             except UiError:
                 view = {"date": day, "dates": [], "warnings": [], "failed": [], "facts": {}}
+                view["storage"] = build_storage_view(conf, None, day, threshold)
             view = overlay_report(
                 view,
                 os.path.join(conf["STATE_DIR"], "history"),
-                int(raw.get("ALERT_REMOTE_BYTES") or 0),
+                threshold,
             )
             sys.stdout.write(json.dumps(view, sort_keys=True) + "\n")
             return 0

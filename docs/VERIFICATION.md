@@ -16,7 +16,7 @@ CRC32C is not read. The endpoint's extra checksum that this plugin trusts is SHA
 
 1. The sizes differ: the object does not match. Nothing is deleted.
 2. A whole-object SHA256 is present. Equal hashes are `sha256`. Different hashes do not match.
-3. No whole-object SHA256, and `etag` matches `etag_for_file(local, PART_SIZE)`: level `etag`. A well-formed ETag that does not match does not match the object.
+3. No whole-object SHA256, and `etag` matches `etag_for_file(local, PART_SIZE)`: level `etag`. A well-formed ETag that does not match does not match the object for the temporary `.uploading` check. After a verified temporary is published with `mc cp`, the final name often loses put SHA256 and shows a different ETag; when the final size still matches the local file, the publish is accepted using the level already proven on `.uploading`.
 4. No SHA256 and no usable ETag: `mc cat` downloads the object and SHA256 is computed locally. A match is level `sha256` because the bytes were hashed. This is the path already used when a multipart checksum suffix hides the real hash.
 5. `sample_sha256` hashes the size plus the first and last 1 MiB. It is not a whole-file hash. It is level `size-only`, and only when that sample is supplied and matches. The engine does not use it to skip the full download. A production object with no SHA256 and no ETag still takes step 4.
 6. If step 4 cannot be read, the attempt is retried. It is not stored as `size-only`.
@@ -57,6 +57,6 @@ An empty directory is not "every account is done". It waits, then becomes partia
 
 `backup_days.run_state` is the queue flag shared by account uploads and the system mirror: `open`, `system_running`, `complete`, or `partial`. The file lock is still `run/upload.lock`, held for one file and then released, so an account `put` and a system file take turns. `send-system.lock` stays one mirror, non-blocking. A second mirror exits while the first is running; the first loop sees a tar that appears late and restarts its stable window.
 
-On partial: system files that already exist are still uploaded, `manifest.json` is not uploaded, the pending marker stays, and the report says the day is partial. The email is still sent from the end of `send-system.sh`. Its status comes from the database when `state/parspack.db` exists. Log parsing remains the fallback.
+On partial: system files are not uploaded (so they do not fight cPanel account puts for `upload.lock`), `manifest.json` is not uploaded, the pending marker stays for a later `send-remaining`, and the report says the day is partial. The email is still sent from the end of `send-system.sh`. Its status comes from the database when `state/parspack.db` exists. Log parsing remains the fallback.
 
 A late account after the manifest was uploaded is a new `put`. The previous manifest is then stale until another mirror closes the enlarged set and uploads a new manifest. A retry of a failed account uses the same database row and the same per-file lock.

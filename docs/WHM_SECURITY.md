@@ -29,6 +29,6 @@ Run this on the WHM host after the page is installed. The Windows tests cover th
 ## Secrets and headers
 
 - Settings must show `Configured` for a stored SMTP password, webhook secret, Telegram token, and Slack URL, and the HTML and the audit log must not contain those values.
-- Response headers should include `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: same-origin`, and a Content-Security-Policy with `default-src 'none'`.
+- Response headers should include `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: same-origin`, and a Content-Security-Policy with `default-src 'self'`. Same-origin scripts and styles must be allowed so `WHM::header` can draw the left navigation. Third-party hosts stay blocked.
 - Send nine POSTs in one minute. The ninth must be refused by the rate limit.
 - Leave `WEBHOOK_ENABLED=0` and confirm no webhook is attempted. An `http://` URL or a URL with userinfo must be rejected. Telegram and Slack stay off until their own enable flag is `1`.

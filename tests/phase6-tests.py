@@ -104,11 +104,33 @@ def test_alerts():
         fail("verification failure was not critical")
     facts["verify_failed"] = 0
     facts["pending"] = True
-    if parspack_ui.classify_alerts({"status": "OK", "remote_ok": True}, facts, 0)["severity"] != "critical":
+    pending_alert = parspack_ui.classify_alerts({"status": "OK", "remote_ok": True}, facts, 0)
+    if pending_alert["severity"] != "critical":
         fail("pending system was not critical")
+    facts["accounts_complete"] = True
+    facts["accounts_ok"] = 10
+    facts["accounts_failed"] = 0
+    pending_ok_accounts = parspack_ui.classify_alerts({"status": "CRITICAL", "remote_ok": True}, facts, 0)
+    if pending_ok_accounts["severity"] != "critical":
+        fail("pending with complete accounts was not critical")
+    if not any(
+        item.get("text") == "accounts transferred but system backup incomplete"
+        for item in pending_ok_accounts["warnings"]
+    ):
+        fail("pending with complete accounts used the wrong warning text")
     facts["pending"] = False
+    facts.pop("accounts_complete", None)
+    facts.pop("accounts_ok", None)
+    facts.pop("accounts_failed", None)
     if parspack_ui.classify_alerts({"status": "OK", "remote_ok": False}, facts, 0)["severity"] != "critical":
         fail("remote outage was not critical")
+    facts["upload_failed"] = 0
+    facts["storage_full"] = True
+    storage = parspack_ui.classify_alerts({"status": "OK", "remote_ok": True}, facts, 0)
+    if storage["severity"] != "critical":
+        fail("storage full was not critical")
+    if not any(item.get("text") == "destination storage is full" for item in storage["warnings"]):
+        fail("storage full warning text was missing")
     facts = {
         "verify_failed": 0, "upload_failed": 0, "cleanup_failed": 1,
         "remote_bytes": 50, "local_freed": 0, "run_state": "complete",
@@ -116,6 +138,25 @@ def test_alerts():
     }
     if parspack_ui.classify_alerts({"status": "OK", "remote_ok": True}, facts, 40)["severity"] != "warning":
         fail("threshold or cleanup was not a warning")
+    facts = {
+        "verify_failed": 0, "upload_failed": 0, "cleanup_failed": 0,
+        "remote_bytes": 10, "local_freed": 0, "run_state": "complete",
+        "pending": False, "remote_ok": True, "retention_failed": True,
+    }
+    retention = parspack_ui.classify_alerts({"status": "OK", "remote_ok": True}, facts, 0)
+    if retention["severity"] != "warning":
+        fail("retention failure was not a warning")
+    if not any(item.get("text") == "remote keep window did not finish" for item in retention["warnings"]):
+        fail("retention failure warning text was missing")
+    if parspack_ui.reason_fa("Copied object failed verification after publish") != "بعد از کپی به نام نهایی، تأیید مقصد ناموفق بود":
+        fail("reason_fa did not translate verification failure")
+    disk = parspack_ui.local_disk_usage([tempfile.gettempdir()])
+    if not disk.get("ok") or int(disk.get("total") or 0) <= 0 or int(disk.get("free") or 0) < 0:
+        fail("local disk usage was not readable")
+    if parspack_ui.local_disk_usage([])["ok"]:
+        fail("empty roots should not report local disk ok")
+    if parspack_ui.day_local_bytes([tempfile.gettempdir()], "not-a-date") != 0:
+        fail("invalid day local bytes should be zero")
     path = os.path.join(tempfile.mkdtemp(prefix="pp-dedupe-"), "alert-dedupe.json")
     warnings = [{"severity": "warning", "text": "some accounts failed"}]
     token = parspack_ui.fingerprint("2026-10-08", "warning", warnings)
@@ -198,6 +239,19 @@ def test_channels_and_settings():
             fail("settings view exposed a secret")
     if view["smtp_password_set"] != "1" or view["secret_key"] != "Configured":
         fail("configured flag was missing")
+    if view["allow_remote_delete"] != "0" or view["delete_local_after_success"] != "0":
+        fail("delete switches defaulted on")
+    if view["remote_keep_days"] != "0":
+        fail("keep days defaulted above zero")
+    rewritten = parspack_config.rewrite_conf(
+        'ALLOW_REMOTE_DELETE="0"\nDELETE_LOCAL_AFTER_SUCCESS="0"\n',
+        {"ALLOW_REMOTE_DELETE": "1", "DELETE_LOCAL_AFTER_SUCCESS": "1", "REMOTE_KEEP_DAYS": "10"},
+        allowed=parspack_config.SETTINGS_KEYS,
+    )
+    if 'ALLOW_REMOTE_DELETE="1"' not in rewritten or 'DELETE_LOCAL_AFTER_SUCCESS="1"' not in rewritten:
+        fail("delete switches were not rewritten")
+    if 'REMOTE_KEEP_DAYS="10"' not in rewritten:
+        fail("keep days were not rewritten")
     audit_path = os.path.join(tempfile.mkdtemp(prefix="pp-audit-"), "audit.log")
     parspack_ui.append_audit(audit_path, "root", ["SMTP_PASSWORD", "WEBHOOK_URL"])
     line = open(audit_path, "r", encoding="utf-8").read()

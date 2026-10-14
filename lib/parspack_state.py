@@ -754,6 +754,78 @@ def accounts_waiting(conn, day, names):
     return waiting
 
 
+def verified_account_names(conn, day):
+    """Account basenames already terminal-success for this day (local tars may be gone)."""
+    if not DATE_RE.fullmatch(day) and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise StateError("backup date is invalid")
+    rows = conn.execute(
+        "SELECT DISTINCT account FROM uploads WHERE backup_date = ? "
+        "AND account != '' AND account != 'system' "
+        "AND remote_key LIKE '%/accounts/%' "
+        "AND status IN (%s) ORDER BY account"
+        % ",".join("?" for _ in SUCCESS_STATUSES),
+        (day,) + SUCCESS_STATUSES,
+    ).fetchall()
+    return [row["account"] for row in rows]
+
+
+def system_success_count(conn, day):
+    """How many system-tree rows are already verified for this day."""
+    if not DATE_RE.fullmatch(day) and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise StateError("backup date is invalid")
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM uploads WHERE backup_date = ? "
+        "AND (account = 'system' OR remote_key LIKE '%/system/%') "
+        "AND status IN (%s)"
+        % ",".join("?" for _ in SUCCESS_STATUSES),
+        (day,) + SUCCESS_STATUSES,
+    ).fetchone()[0])
+
+
+def _ts_epoch(stamp):
+    stamp = (stamp or "").strip()
+    if len(stamp) < 19:
+        return 0
+    try:
+        return int(time.mktime(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")))
+    except (ValueError, OverflowError):
+        return 0
+
+
+def accounts_day_gate(conn, day, idle_seconds, now, deadline):
+    """Close the account phase from DB when local tars were already deleted.
+
+    ready = every account row is terminal, at least one success, and no account
+    upload row was updated in the last idle_seconds (new tars still arriving).
+    """
+    if not DATE_RE.fullmatch(day) and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise StateError("backup date is invalid")
+    now = int(now)
+    deadline = int(deadline)
+    idle_seconds = max(0, int(idle_seconds))
+    rows = list(conn.execute(
+        "SELECT account, status, updated_at FROM uploads WHERE backup_date = ? "
+        "AND account != '' AND account != 'system' "
+        "AND remote_key LIKE '%/accounts/%'",
+        (day,),
+    ))
+    if not rows:
+        return ("partial" if now >= deadline else "waiting"), []
+    if any(row["status"] not in TERMINAL_STATUSES for row in rows):
+        return ("partial" if now >= deadline else "waiting"), []
+    success = sorted({
+        row["account"] for row in rows if row["status"] in SUCCESS_STATUSES
+    })
+    if not success:
+        return ("partial" if now >= deadline else "waiting"), []
+    last = 0
+    for row in rows:
+        last = max(last, _ts_epoch(row["updated_at"]))
+    if last and (now - last) < idle_seconds:
+        return "waiting", success
+    return "ready", success
+
+
 def set_run_state(conn, day, state):
     if state not in RUN_STATES:
         raise StateError("run state is not open, system_running, complete, or partial")
@@ -932,6 +1004,23 @@ def main(argv=None):
                 flags.get("deadline", "0"),
             )
             print(gate)
+            return {"ready": 0, "waiting": 1, "partial": 2}[gate]
+        if command == "verified_names":
+            names = verified_account_names(conn, flags.get("date", ""))
+            print(",".join(names))
+            return 0 if names else 1
+        if command == "system_success_count":
+            print(system_success_count(conn, flags.get("date", "")))
+            return 0
+        if command == "accounts_day_gate":
+            gate, names = accounts_day_gate(
+                conn,
+                flags.get("date", ""),
+                flags.get("idle", "120"),
+                flags.get("now", "0"),
+                flags.get("deadline", "0"),
+            )
+            print("%s\t%s" % (gate, ",".join(names)))
             return {"ready": 0, "waiting": 1, "partial": 2}[gate]
         if command == "manifest":
             expected = [item for item in (flags.get("expected") or "").split(",") if item]

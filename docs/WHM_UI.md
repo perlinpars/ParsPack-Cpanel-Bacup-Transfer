@@ -40,10 +40,12 @@ Every state-changing form also posts the 64-hex token from `state/whm-csrf`, com
 
 ## What the page shows
 
-The default tab is the dashboard. It calls `lib/parspack_ui.py dashboard`, which opens `state/parspack.db` read-only. That path does not migrate, import, or recover rows. Counts, the system marker, recorded remote bytes, and local bytes freed come from the database. Remote usage is labeled recorded because this page does not ask the bucket for a quota.
+The default tab is the dashboard. It calls `lib/parspack_ui.py dashboard`, which opens `state/parspack.db` read-only. That path does not migrate, import, or recover rows. Counts, the system marker, recorded remote bytes, and local bytes freed come from the database. Local free/used space comes from `statvfs` on `LOCAL_READ_ROOTS`. Destination used size prefers a short cached `mc du` of the configured prefix (5 minutes) and falls back to the sum of verified sizes in the database. S3 usually does not expose free quota; when `ALERT_REMOTE_BYTES` is set, the bar is relative to that threshold.
 
 Retry posts the account name and calls `lib/parspack_ops.py retry --account NAME`. The name must match `^[A-Za-z0-9._+-]{1,64}$`. The date in the form is only used to return to the same dashboard day. It is not passed to the retry command.
 
-Settings calls `mail-settings` and shows S3 and channel secrets as `Configured` or `Missing`. Saving posts `update-settings` with the whitelist in `SETTINGS_KEYS`. A blank secret keeps the stored value. `SMTP_TLS` stays `1`. Test connection calls `connection-test`. The audit table reads `state/audit.log` and shows the key names only.
+The reports user table shows 20 rows per page (`?tab=reports&date=YYYY-MM-DD&page=N`). Transfer status is summarized in Persian. Long reasons are truncated in the cell and kept full in the `title` attribute.
+
+Settings calls `mail-settings` and shows S3 and channel secrets as `Configured` or `Missing`. The form is three closed sections: transfer and delete, email, and alerts. Saving posts `update-settings` with the whitelist in `SETTINGS_KEYS`. That whitelist includes `ALLOW_REMOTE_DELETE`, `REMOTE_KEEP_DAYS`, and `DELETE_LOCAL_AFTER_SUCCESS`. `REMOTE_KEEP_DAYS` is `0` through `3650`. A positive value keeps today through that many days ago. After a successful system transfer, `retention --apply` removes older date folders. Today and the newest verified day stay. An unchecked box writes `0`. A blank secret keeps the stored value. `SMTP_TLS` stays `1`. Test connection calls `connection-test`. The audit table reads `state/audit.log` and shows the key names only. A destination-full upload is FATAL and surfaces as «فضای مقصد پر است» on the dashboard.
 
 The reports tab is unchanged in purpose: it can rebuild one day and start `send-remaining.sh`. Email is sent at the end of `send-system.sh`, then deduplicated. There is no upload cron.

@@ -149,6 +149,10 @@ before_store="$(find "$FAKE_STORE" -type f | sort)"
 expect 3 "TEST mode uploads nothing and exits 3" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
 after_store="$(find "$FAKE_STORE" -type f | sort)"
 [[ "$before_store" == "$after_store" ]] && ok "TEST mode stored nothing" || bad "TEST mode stored data"
+echo "cpanel-validation-probe" > "$B/probe.txt"
+chmod 644 "$B/probe.txt"
+expect 0 "TEST mode uploads the WHM validation file" "$E" "$B/probe.txt" "validate.tmp-512847-1791536241.txt"
+[[ "$(cat "$FAKE_STORE/mybucket/cpanel/validate.tmp-512847-1791536241.txt")" == "cpanel-validation-probe" ]] && ok "validation probe object was stored" || bad "validation probe object was missing"
 conf
 export FAKE_MC_NOISE=1 FAKE_MC_FAIL_PUTS=1
 echo "noisy-retry" > "$B/noisy.tar.gz"
@@ -167,6 +171,26 @@ expect 0 "VERIFY skips a matching checksum" "$E" "$B/u.tar.gz" "2026-09-28/u.tar
 echo "different-size-content-xx" > "$B/u.tar.gz"
 expect 1 "VERIFY refuses a different size" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
 [[ "$(cat "$FAKE_STORE/mybucket/cpanel/2026-09-28/u.tar.gz")" == "backup-data-1234" ]] && ok "remote object was left untouched" || bad "remote object was overwritten"
+printf 'AAAAAAAA' > "$B/same.tar.gz"
+chmod 644 "$B/same.tar.gz"
+expect 0 "seed same-size object for reupload" "$E" "$B/same.tar.gz" "2026-09-27/same.tar.gz"
+printf 'BBBBBBBB' > "$B/same.tar.gz"
+expect 0 "VERIFY reuploads same size with wrong checksum" "$E" "$B/same.tar.gz" "2026-09-27/same.tar.gz"
+if [[ "$(cat "$FAKE_STORE/mybucket/cpanel/2026-09-27/same.tar.gz")" == "BBBBBBBB" ]] && grep -q "replacing that one object" "$P/logs/backup.log"; then
+  ok "same-size wrong checksum was replaced in PRODUCTION"
+else
+  bad "same-size wrong checksum was not replaced"
+fi
+mkdir -p "$FAKE_STORE/mybucket/cpanel/2026-08-10"
+echo "leftover-temp" > "$FAKE_STORE/mybucket/cpanel/2026-08-10/orphan.tar.gz.uploading"
+echo "orphan-body" > "$B/orphan.tar.gz"
+chmod 644 "$B/orphan.tar.gz"
+expect 0 "upload clears orphan .uploading first" "$E" "$B/orphan.tar.gz" "2026-08-10/orphan.tar.gz"
+if [[ -f "$FAKE_STORE/mybucket/cpanel/2026-08-10/orphan.tar.gz" && ! -e "$FAKE_STORE/mybucket/cpanel/2026-08-10/orphan.tar.gz.uploading" ]]; then
+  ok "orphan .uploading object was removed"
+else
+  bad "orphan .uploading object remained"
+fi
 conf REMOTE_EXISTS_POLICY=REPLACE
 expect 0 "REPLACE overwrites" "$E" "$B/u.tar.gz" "2026-09-28/u.tar.gz"
 conf REMOTE_EXISTS_POLICY=SKIP
@@ -193,6 +217,16 @@ rm -f "$B/two.tar.gz"
 echo "abc" > "$B/multi.tar.gz"
 expect 0 "multipart checksum falls back to full content" "$E" "$B/multi.tar.gz" "2026-08-15/multipart.tar.gz"
 grep -q "Remote object content SHA256 verified" "$P/logs/backup.log" && ok "content verification was logged" || bad "content verification was not logged"
+export FAKE_MC_MODE=publish-etag-skew
+echo "publish-skew-body" > "$B/skew.tar.gz"
+chmod 644 "$B/skew.tar.gz"
+expect 0 "publish accepts size when copy ETag skews" "$E" "$B/skew.tar.gz" "2026-08-16/skew.tar.gz"
+if [[ -f "$FAKE_STORE/mybucket/cpanel/2026-08-16/skew.tar.gz" ]] && grep -q "size matched after verified temporary" "$P/logs/backup.log"; then
+  ok "publish size fallback after copy metadata skew"
+else
+  bad "publish did not accept size after copy metadata skew"
+fi
+unset FAKE_MC_MODE
 echo "keep-local" > "$B/keep.tar.gz"
 chmod 644 "$B/keep.tar.gz"
 expect 0 "verified upload with local delete disabled" "$E" "$B/keep.tar.gz" "2026-08-03/keep.tar.gz"
@@ -313,6 +347,29 @@ grep -q 'my ($local_file, $dest_file) = @args\[0, 1\];' "$P/transport/parspack_t
 grep -q 'my ($remote_file, $local_file) = @args\[0, 1\];' "$P/transport/parspack_transport.pl" && ok "get follows the Perl skeleton argument order" || bad "get argument order changed"
 grep -q 'exit 3' "$P/bin/engine-upload.sh" && ok "TEST mode put still exits 3" || bad "TEST mode exit 3 was removed"
 
+echo "== mirror-needed"
+mkdir -p "$P/state"
+python3 - <<PY
+import sys
+sys.path.insert(0, "$P/lib")
+import parspack_state
+conn = parspack_state.connect("$P/state/parspack.db")
+for day, state in (("2026-10-03", "partial"), ("2026-10-04", "complete"), ("2026-10-05", "open")):
+    conn.execute(
+        "INSERT OR REPLACE INTO backup_days (backup_date, created_at, updated_at, run_state) VALUES (?,?,?,?)",
+        (day, "2026-10-03T00:00:00", "2026-10-03T00:00:00", state),
+    )
+conn.commit()
+PY
+run_to "$P/lib/parspack_config.py" mirror-needed -- 2026-10-03
+[[ "$RUN_RC" -eq 0 && "$(cat "$T/out")" == "0" ]] && ok "mirror-needed is 0 for partial" || bad "mirror-needed partial (rc=$RUN_RC out=$(cat "$T/out"))"
+run_to "$P/lib/parspack_config.py" mirror-needed -- 2026-10-04
+[[ "$RUN_RC" -eq 0 && "$(cat "$T/out")" == "0" ]] && ok "mirror-needed is 0 for complete" || bad "mirror-needed complete (rc=$RUN_RC out=$(cat "$T/out"))"
+run_to "$P/lib/parspack_config.py" mirror-needed -- 2026-10-05
+[[ "$RUN_RC" -eq 0 && "$(cat "$T/out")" == "1" ]] && ok "mirror-needed is 1 for open" || bad "mirror-needed open (rc=$RUN_RC out=$(cat "$T/out"))"
+run_to "$P/lib/parspack_config.py" mirror-needed -- 2099-01-01
+[[ "$RUN_RC" -eq 0 && "$(cat "$T/out")" == "1" ]] && ok "mirror-needed is 1 for a missing day" || bad "mirror-needed missing (rc=$RUN_RC out=$(cat "$T/out"))"
+
 echo "== pending marker"
 DAY=2026-10-02
 mkdir -p "$B/$DAY/accounts" "$B/$DAY/system"
@@ -347,11 +404,19 @@ echo "== transport compile"
 if ! command -v perl >/dev/null 2>&1; then
   bad "perl -c transport (perl is not installed)"
 else
-  if perl -c "$P/transport/parspack_transport.pl" >"$T/perl-c.out" 2>&1; then
-    ok "perl -c transport"
+  if perl -c "$P/transport/parspack_transport.pl" >"$T/perl-c.out" 2>"$T/perl-c.err"; then
+    # perl -c writes "syntax OK" to stderr. Anything else is a warning cPanel
+    # will treat as a failed transport command.
+    grep -v ' syntax OK$' "$T/perl-c.err" >"$T/perl-c.warn" || true
+    if [[ ! -s "$T/perl-c.warn" ]]; then
+      ok "perl -c transport"
+    else
+      bad "perl -c transport wrote a warning"
+      sed 's/^/        /' "$T/perl-c.warn" | head -8
+    fi
   else
     bad "perl -c transport"
-    sed 's/^/        /' "$T/perl-c.out" | head -8
+    sed 's/^/        /' "$T/perl-c.out" "$T/perl-c.err" | head -8
   fi
 fi
 python3 - "$P" >"$T/fsync-scan.out" 2>&1 <<'PY'

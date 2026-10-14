@@ -116,6 +116,36 @@ def test_many_dates():
         fail("unknown retention predicted a delete")
 
 
+def test_keep_window():
+    today = "2026-10-09"
+    window = dict(CONF)
+    window["REMOTE_KEEP_DAYS"] = "10"
+    if parspack_retention.keep_cutoff(today, 10) != "2026-09-29":
+        fail("keep cutoff was wrong")
+    if parspack_retention.keep_cutoff(today, 20) != "2026-09-19":
+        fail("20 day cutoff was wrong")
+    days = ["2026-08-01", "2026-09-28", "2026-09-29", "2026-10-01", "2026-10-09"]
+    remove, reason = parspack_retention.plan_keep_window(days, today, 10, "2026-10-01")
+    if reason != "ok" or remove != ["2026-08-01", "2026-09-28"]:
+        fail("keep window plan %s %s" % (remove, reason))
+    held, why = parspack_retention.plan_keep_window(days, today, 10, None)
+    if held or why != "newest verified day is unknown":
+        fail("unknown newest day was pruned")
+    older_newest, why = parspack_retention.plan_keep_window(days, today, 10, "2026-08-01")
+    if "2026-08-01" in older_newest or why != "ok":
+        fail("newest verified day was planned for removal")
+    message = refused("2026-10-01", conf=window, newest="2026-09-01")
+    if message != "refused: inside the keep window":
+        fail(message)
+    message = refused("2026-09-29", conf=window, newest="2026-09-01")
+    if message != "refused: inside the keep window":
+        fail(message)
+    if parspack_retention.authorize(window, "2026-09-28", "rmdir", today, "2026-10-01") != "2026-09-28":
+        fail("a day older than the window was refused")
+    if parspack_retention.authorize(CONF, "2026-09-28", "rmdir", today, "2026-10-01") != "2026-09-28":
+        fail("keep days 0 refused an older folder")
+
+
 def test_event_log():
     tmp = tempfile.mkdtemp(prefix="pp-ret-")
     db_path = os.path.join(tmp, "parspack.db")
@@ -137,5 +167,6 @@ def test_event_log():
 if __name__ == "__main__":
     test_guards()
     test_many_dates()
+    test_keep_window()
     test_event_log()
     print("OK")

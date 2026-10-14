@@ -202,7 +202,16 @@ case "$cmd" in
     fi
     keys="$(printf '%s\n' "$listing" | pp_py retention-confirm -- "$rel")"
     # The trailing slash is the prefix boundary: foo/ must not delete foobar/.
-    pp_mc rm --recursive --force -- "${target}/"
+    # Versioned buckets keep the prefix visible after a plain rm; purge all
+    # object versions under this date folder as well.
+    set +e
+    pp_mc rm --recursive --force --versions -- "${target}/"
+    rm_rc=$?
+    set -e
+    if [[ "$rm_rc" -ne 0 ]]; then
+      # Older mc builds may not support --versions; fall back to plain rm.
+      pp_mc rm --recursive --force -- "${target}/"
+    fi
     printf '%s\n' "$keys" | pp_py retention-log -- "$rel"
     ;;
 

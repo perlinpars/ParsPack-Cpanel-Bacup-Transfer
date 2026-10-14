@@ -20,16 +20,16 @@ Exit status for this plugin:
 
 | Status | Meaning | STDERR |
 | --- | --- | --- |
-| 0 | The transport command succeeded. `put` in `MODE=TEST` does not use 0. | |
+| 0 | The transport command succeeded. A backup `put` in `MODE=TEST` does not use 0. The WHM validation probe does. | |
 | 1 | A path was refused (traversal, symlink, empty file, hard link, illegal remote name) or the operation failed. | `config error: ...` for a path refusal, or the engine log line for an operation failure |
 | 2 | The configuration is invalid: bad `MODE`, endpoint, prefix, permissions, or helper usage. `doctor` uses this status. | `config error: ...` |
-| 3 | `put` while `MODE=TEST`. Nothing was uploaded. | An info line that the bucket was checked and nothing was stored |
+| 3 | `put` of a backup while `MODE=TEST`. Nothing was uploaded. The WHM validation file is not this case. | An info line that the bucket was checked and nothing was stored |
 
 A refused path is not a configuration error. `object-key`, `check-local`, `sha256`, and `remote-compose` exit 1 after a valid configuration has loaded. Loading that configuration still exits 2 when the file itself is wrong. cPanel treats every non-zero status as a failed transfer.
 
 | Command | Documented contract | This plugin | Deviation |
 | --- | --- | --- | --- |
-| `put` | Copy one local file to the remote file. Skeleton args: local file, remote file, host, user. Errors on STDERR. | Resolves the local path, refuses symlinks and paths outside `LOCAL_READ_ROOTS`, uploads through `engine-upload.sh`, verifies size and checksum, then returns the engine status. On success for an account archive, writes `state/system-pending-YYYY-MM-DD` and detaches the system mirror. It does not wait for `system/`. | If the marker cannot be written, `put` exits 1 even though the account object is already verified. If detach fails, `put` still exits 0 and the marker stays. `MODE=TEST` returns exit `3` and uploads nothing. A young file can block inside this process for up to 5 times 60 seconds, plus upload retries. |
+| `put` | Copy one local file to the remote file. Skeleton args: local file, remote file, host, user. Errors on STDERR. | Resolves the local path, refuses symlinks and paths outside `LOCAL_READ_ROOTS`, uploads through `engine-upload.sh`, verifies size and checksum, then returns the engine status. On success for an account archive, writes `state/system-pending-YYYY-MM-DD` and detaches the system mirror. It does not wait for `system/`. | If the marker cannot be written, `put` exits 1 even though the account object is already verified. If detach fails, `put` still exits 0 and the marker stays. `MODE=TEST` returns exit `3` and uploads nothing, except WHM’s validation file (`/var/cpanel/backups/tmp.test.<pid>-<time>`, remote name `validate.tmp-<pid>-<time>.txt`). That probe is uploaded and the command exits 0 so Validate can succeed. cPanel can delete that one object afterward. A real backup still exits 3. A young file can block inside this process for up to 5 times 60 seconds, plus upload retries. |
 | `get` | Copy remote file to local file. Skeleton args: remote, local, host, user. | Downloads to a sibling partial file, checks size and checksum, then renames into place. | Stricter than the sample. A missing checksum downloads the object a second time to hash it. |
 | `ls` | Print `ls -l` compatible text on STDOUT. | Lists one prefix with `mc ls --json` and formats it. A missing directory prints nothing and exits 0, whether the missing-object message arrives on stderr or stdout. `.keep` markers are hidden. | A missing path does not return the non-zero status a local `ls` would. Decision D in `docs/DECISIONS.md`. |
 | `mkdir` | Create the remote directory. Skeleton also receives a recurse flag. | Creates `<path>/.keep` so the prefix exists. An empty path or `/` exits 0. | The recurse flag is not read. `.keep` is an extra object. |
@@ -47,7 +47,7 @@ With `ALLOW_REMOTE_DELETE=0`:
 - `delete` of a backup object does the same.
 - `delete` of `validate.tmp-<digits>-<digits>.txt` still removes that one object.
 
-Result: cPanel’s remote retention cannot prune this destination while the flag is `0`. Objects remain. That is not silent data loss. The bucket can fill. Setting the flag to `1` still refuses any path that is not inside `<prefix>/<YYYY-MM-DD>/`, and it refuses today’s folder and the newest verified day.
+Result: cPanel’s remote retention cannot prune this destination while the flag is `0`. Objects remain. That is not silent data loss. The bucket can fill. Setting the flag to `1` still refuses any path that is not inside `<prefix>/<YYYY-MM-DD>/`, and it refuses today’s folder and the newest verified day. `REMOTE_KEEP_DAYS` defaults to `0`. A positive value also refuses a day that is still inside that window, and after a successful system transfer removes only the older date folders.
 
 Local retention is separate. [Backup Configuration](https://docs.cpanel.net/whm/backup/backup-configuration/) says that if “Retain Backups in the Default Backup Directory” is off, cPanel deletes account backup files from the local backup directory only after a successful transfer to at least one additional destination and an attempt to every destination. That setting does not remove system backup files. This plugin can also delete a local file after the remote object is verified, then checked again for size, when `DELETE_LOCAL_AFTER_SUCCESS=1`. `DELETE_LOCAL_DELAY` is `0`, `10m`, `1h`, or `manual`. A failed local delete is `LOCAL_CLEANUP_FAILED` and the `put` still exits 0.
 
@@ -82,7 +82,7 @@ No other Perl, shell, or PHP file calls `fsync`. `lib/parspack_config.py` calls 
 
 ## Perl 5.16 language level
 
-The transport does not enable a feature bundle and does not use signatures, `say`, `state`, `given`/`when`, `fc`, postfix dereferencing, or `try`. The only syntax newer than Perl 5.8 is the defined-or operator `//` in the `get` argument check. That operator has been unconditional syntax since Perl 5.10, so it is valid on 5.16. `strict` and `warnings` are on. `perl -c` may still warn that the statement after `exec` looks unreachable; that line runs when `exec` fails, and the warning does not fail compilation.
+The transport does not enable a feature bundle and does not use signatures, `say`, `state`, `given`/`when`, `fc`, postfix dereferencing, or `try`. The only syntax newer than Perl 5.8 is the defined-or operator `//` in the `get` argument check. That operator has been unconditional syntax since Perl 5.10, so it is valid on 5.16. `strict` and `warnings` are on. The `exec` that detaches the system mirror is written as `exec ... or do { ... }` so Perl does not warn `Statement unlikely to be reached`. That warning is printed at compile time, on every command, and cPanel treats it as a failed upload. The `do` block still runs only when `exec` fails.
 
 ## Not specified by the transport page
 

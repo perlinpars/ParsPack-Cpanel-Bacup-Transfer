@@ -61,10 +61,17 @@ DELETE_LOCAL_DELAY="0"
 # before the detached system mirror starts or reports the day as partial.
 SYSTEM_SET_STABLE_SECONDS="120"
 SYSTEM_DEADLINE_SECONDS="21600"
+# Lock wait for system/ puts after every account is terminal. Account puts
+# keep UPLOAD_LOCK_WAIT_SECONDS (default 120, maximum 240).
+SYSTEM_UPLOAD_LOCK_WAIT_SECONDS="600"
 # 0 refuses cPanel's delete and rmdir. 1 allows them only for a YYYY-MM-DD
 # folder under PARSPACK_PREFIX, and still refuses today and the newest
-# verified day. There is no separate retention cron.
+# verified day.
 ALLOW_REMOTE_DELETE="0"
+# 0 does not prune by age. 10 keeps today through ten days ago and, after a
+# successful system transfer, removes older date folders. Today and the newest
+# verified day stay even when they are older than this window.
+REMOTE_KEEP_DAYS="0"
 
 # These directories must stay inside /root/parspack-backup.
 LOG_DIR="/root/parspack-backup/logs"

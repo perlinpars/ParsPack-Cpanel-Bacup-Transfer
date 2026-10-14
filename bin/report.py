@@ -15,6 +15,7 @@ from email.mime.text import MIMEText
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import parspack_config  # noqa: E402
+import parspack_ui  # noqa: E402
 
 
 def read_events(path):
@@ -107,24 +108,56 @@ def source_accounts(roots, day):
     return found
 
 
-def list_remote_accounts(conf, day):
-    target = parspack_config.object_target(conf, day + "/accounts", require_child=True) + "/"
+def source_system_files(roots, day):
+    """Relative paths under system/ still on the local day tree."""
+    found = {}
+    for root in roots:
+        folder = os.path.join(root, day, "system")
+        if os.path.islink(folder) or not os.path.isdir(folder):
+            continue
+        for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+            dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                rel = os.path.relpath(path, folder).replace("\\", "/")
+                try:
+                    found[rel] = os.path.getsize(path)
+                except OSError:
+                    continue
+        break
+    return found
+
+
+def _mc_ls_json(conf, target, recursive=False):
     env = {
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": "/root",
         "TMPDIR": os.path.join(ROOT, "tmp"),
         "LANG": "C",
     }
-    command = [conf["MC_BIN"], "--config-dir", conf["MC_CONFIG_DIR"], "ls", "--json", "--", target]
+    command = [conf["MC_BIN"], "--config-dir", conf["MC_CONFIG_DIR"], "ls", "--json"]
+    if recursive:
+        command.append("--recursive")
+    command.extend(["--", target])
     try:
         proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=180)
     except (OSError, subprocess.TimeoutExpired):
-        return {}, [], False
+        return None
     if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def list_remote_accounts(conf, day):
+    target = parspack_config.object_target(conf, day + "/accounts", require_child=True) + "/"
+    text = _mc_ls_json(conf, target, recursive=False)
+    if text is None:
         return {}, [], False
     accounts = {}
     leftovers = []
-    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -145,6 +178,39 @@ def list_remote_accounts(conf, day):
         elif kind == "leftover":
             leftovers.append({"name": leaf, "size": size})
     return accounts, leftovers, True
+
+
+def list_remote_system_files(conf, day):
+    """Remote files under <day>/system/. Keys are relative paths; excludes .uploading."""
+    target = parspack_config.object_target(conf, day + "/system", require_child=True) + "/"
+    text = _mc_ls_json(conf, target, recursive=True)
+    if text is None:
+        return {}, False
+    files = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or str(row.get("type", "")).lower() == "folder":
+            continue
+        key = str(row.get("key") or row.get("name") or "").replace("\\", "/").lstrip("/")
+        leaf = key.rstrip("/").split("/")[-1]
+        if not leaf or leaf.endswith(".uploading") or leaf == ".keep":
+            continue
+        size = row.get("size")
+        if not isinstance(size, int):
+            size = 0
+        # Prefer path relative to system/
+        rel = key
+        marker = "/system/"
+        if marker in "/" + key:
+            rel = key.split("system/", 1)[-1]
+        files[rel] = size
+    return files, True
 
 
 def parse_log(path, day):
@@ -286,40 +352,83 @@ def send_email(raw, subject, html_body):
         return False
 
 
-def db_day_note(status, day):
+def reason_fa(message):
+    """Map common English engine/log lines to short Persian explanations."""
+    return parspack_ui.reason_fa(message)
+
+
+def status_cause_fa(status, db_note=""):
+    """One Persian sentence for the reports card / email status."""
+    if db_note:
+        return db_note
+    if status == "CRITICAL":
+        return (
+            "حساب‌های کاربری ممکن است منتقل شده باشند، ولی پوشه system و "
+            "manifest.json هنوز تمام و تأیید نشده‌اند. برای تکمیل روز از ارسال مانده‌ها استفاده کنید."
+        )
+    if status == "PROBLEM":
+        return "برخی حساب‌ها منتقل نشدند یا فهرست مقصد خوانده نشد."
+    if status == "WARNING":
+        return "انتقال اصلی انجام شد ولی هشدارهایی (مثل فایل محلی مانده یا prune مقصد) وجود دارد."
+    if status == "EMPTY":
+        return "برای این روز هنوز انتقالی ثبت نشده است."
+    return ""
+
+
+def db_day_note(status, day, state_dir="", accounts_complete=False):
     """Raise OK to WARNING from the state database. A pending marker stays CRITICAL."""
-    db_path = os.path.join(ROOT, "state", "parspack.db")
-    if not os.path.isfile(db_path):
-        return status, ""
-    try:
-        import parspack_state
-        conn = parspack_state.connect(db_path)
-        flags = parspack_state.day_flags(conn, day)
-    except Exception:
-        return status, ""
+    state_dir = state_dir or os.path.join(ROOT, "state")
     notes = []
-    if flags["run_state"] == "partial" and status == "OK":
-        status = "WARNING"
-        notes.append("مهلت انتقال تمام شد و این روز ناقص مانده است. manifest.json ارسال نشد.")
-    elif flags["run_state"] == "partial":
-        notes.append("مهلت انتقال تمام شد و این روز ناقص مانده است. manifest.json ارسال نشد.")
-    if flags["cleanup"]:
+    db_path = os.path.join(state_dir, "parspack.db")
+    if os.path.isfile(db_path):
+        try:
+            import parspack_state
+            conn = parspack_state.connect(db_path)
+            flags = parspack_state.day_flags(conn, day)
+        except Exception:
+            flags = None
+        if flags:
+            if flags["run_state"] == "partial":
+                if status == "OK":
+                    status = "WARNING"
+                if accounts_complete:
+                    notes.append(
+                        "مهلت انتقال تمام شد؛ حساب‌ها منتقل شده‌اند ولی "
+                        "پوشه system و manifest.json ارسال نشد."
+                    )
+                else:
+                    notes.append("مهلت انتقال تمام شد و این روز ناقص مانده است. manifest.json ارسال نشد.")
+            if flags["cleanup"]:
+                if status == "OK":
+                    status = "WARNING"
+                notes.append("حذف فایل محلی بعد از تأیید مقصد انجام نشد.")
+            if flags["size_only"]:
+                if status == "OK":
+                    status = "WARNING"
+                notes.append("برخی فایل‌ها فقط با اندازه تأیید شدند.")
+    if day in parspack_config.retention_failed_days(state_dir):
         if status == "OK":
             status = "WARNING"
-        notes.append("حذف فایل محلی بعد از تأیید مقصد انجام نشد.")
-    if flags["size_only"]:
-        if status == "OK":
-            status = "WARNING"
-        notes.append("برخی فایل‌ها فقط با اندازه تأیید شدند.")
+        notes.append(
+            "پاک‌سازی بکاپ‌های قدیمی مقصد (پنجرهٔ نگهداری) تمام نشد؛ "
+            "انتقال این روز انجام شده است."
+        )
     return status, " ".join(notes)
 
 
 def build_report(conf, day):
     roots = parspack_config.split_roots(conf["LOCAL_READ_ROOTS"])
     local = source_accounts(roots, day)
+    local_system = source_system_files(roots, day)
     remote, leftovers, remote_ok = list_remote_accounts(conf, day)
+    remote_system, system_ok_listing = list_remote_system_files(conf, day)
+    if not system_ok_listing:
+        remote_system = {}
     outcomes, started, finished = parse_log(os.path.join(conf["LOG_DIR"], "backup.log"), day)
-    names = sorted(set(local) | set(remote) | set(outcomes))
+    # Account rows only (users under accounts/). System files are counted separately.
+    names = sorted(set(local) | set(remote) | {
+        name for name, item in outcomes.items() if item.get("scope") != "system"
+    })
     rows = []
     transferred_bytes = 0
     remaining_bytes = 0
@@ -327,31 +436,51 @@ def build_report(conf, day):
         on_remote = name in remote
         on_local = name in local
         outcome = outcomes.get(name, {})
-        system_ok = outcome.get("scope") == "system" and outcome.get("status") == "ok"
-        if on_remote or system_ok:
+        if on_remote:
             state = "منتقل شد"
-            if on_remote:
-                transferred_bytes += remote[name]
+            transferred_bytes += remote[name]
             if on_local:
                 state = "در مقصد هست و فایل محلی هم مانده"
                 remaining_bytes += local[name]
+            ok = True
         else:
             state = "منتقل نشد"
             remaining_bytes += local.get(name, 0)
+            ok = False
         reason = outcome.get("reason") or ""
         if on_remote and outcome.get("status") == "failed":
             reason = "خطای قبلی بود و بعداً محتوا تأیید شد"
+        else:
+            reason = reason_fa(reason)
         rows.append({
             "name": name,
+            "user": account_user(name),
             "state": state,
             "remote_size": remote.get(name, 0),
             "local_size": local.get(name, 0),
             "reason": reason,
             "start": outcome.get("start", ""),
             "end": outcome.get("end", ""),
-            "ok": on_remote or system_ok,
+            "ok": ok,
+            "kind": "account",
         })
     failed = [row for row in rows if not row["ok"]]
+    account_expected = len(set(local) | set(remote))
+    # Prefer remote count when local accounts were already deleted after success.
+    account_transferred = len(remote)
+    account_failed = len(failed)
+    system_expected = len(set(local_system) | set(remote_system))
+    system_transferred = len(remote_system)
+    for rel, size in remote_system.items():
+        transferred_bytes += int(size or 0)
+    for rel, size in local_system.items():
+        if rel not in remote_system:
+            remaining_bytes += int(size or 0)
+    files_expected = account_expected + system_expected
+    files_transferred = account_transferred + system_transferred
+    accounts_complete = account_expected > 0 and account_failed == 0 and account_transferred >= account_expected
+    if account_expected == 0 and account_transferred > 0 and account_failed == 0:
+        accounts_complete = True
     warning = bool(leftovers) or any(row["ok"] and row["local_size"] for row in rows)
     if not remote_ok:
         status = "PROBLEM"
@@ -361,16 +490,43 @@ def build_report(conf, day):
         status = "WARNING"
     else:
         status = "OK"
-    status, db_note = db_day_note(status, day)
-    if day in parspack_config.pending_system_days(conf["STATE_DIR"]):
+    status, db_note = db_day_note(status, day, conf["STATE_DIR"], accounts_complete=accounts_complete)
+    pending = day in parspack_config.pending_system_days(conf["STATE_DIR"])
+    if pending:
         status = "CRITICAL"
+        if accounts_complete:
+            primary = (
+                "حساب‌های کاربری منتقل شده‌اند، ولی پوشه system و manifest.json "
+                "هنوز تمام و تأیید نشده‌اند. برای تکمیل روز از ارسال مانده‌ها استفاده کنید."
+            )
+        else:
+            primary = "انتقال فولدر system برای این روز تمام و تأیید نشده است."
+        extras = []
+        for part in (db_note or "").replace("؟", ".").split("."):
+            chunk = part.strip()
+            if not chunk:
+                continue
+            if any(token in chunk for token in ("system", "manifest", "مهلت انتقال", "ناقص مانده")):
+                continue
+            extras.append(chunk)
+        db_note = primary
+        if extras:
+            db_note = primary + " " + ". ".join(extras) + "."
+    status_note = status_cause_fa(status, db_note)
     return {
         "date": day,
         "status": status,
         "remote_ok": remote_ok,
-        "source_count": len(names),
-        "transferred_count": sum(1 for row in rows if row["ok"]),
-        "failed_count": len(failed),
+        "source_count": account_expected,
+        "transferred_count": account_transferred,
+        "failed_count": account_failed,
+        "account_expected": account_expected,
+        "account_transferred": account_transferred,
+        "account_failed": account_failed,
+        "system_expected": system_expected,
+        "system_transferred": system_transferred,
+        "files_expected": files_expected,
+        "files_transferred": files_transferred,
         "transferred_bytes": transferred_bytes,
         "remaining_bytes": remaining_bytes,
         "started": started,
@@ -378,19 +534,29 @@ def build_report(conf, day):
         "rows": rows,
         "leftovers": leftovers,
         "db_note": db_note,
+        "status_note": status_note,
+        "accounts_complete": accounts_complete,
+        "system_pending": pending,
     }
 
 
 def render_report(snapshot):
     status_class = {"OK": "ok", "WARNING": "warning", "PROBLEM": "problem", "CRITICAL": "problem"}[snapshot["status"]]
     status_text = {"OK": "کامل", "WARNING": "هشدار", "PROBLEM": "ناقص", "CRITICAL": "بحرانی"}[snapshot["status"]]
+    account_expected = int(snapshot.get("account_expected", snapshot.get("source_count") or 0) or 0)
+    account_transferred = int(snapshot.get("account_transferred", snapshot.get("transferred_count") or 0) or 0)
+    account_failed = int(snapshot.get("account_failed", snapshot.get("failed_count") or 0) or 0)
+    system_expected = int(snapshot.get("system_expected") or 0)
+    system_transferred = int(snapshot.get("system_transferred") or 0)
+    files_expected = int(snapshot.get("files_expected") or (account_expected + system_expected))
+    files_transferred = int(snapshot.get("files_transferred") or (account_transferred + system_transferred))
     body = []
     for row in snapshot["rows"]:
         body.append(
             "<tr class=\"%s\"><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
             % (
                 "good" if row["ok"] else "bad",
-                html.escape(row["name"]),
+                html.escape(row.get("user") or account_user(row["name"])),
                 html.escape(row["state"]),
                 html.escape(human_size(row["remote_size"]) if row["remote_size"] else "-"),
                 html.escape(human_size(row["local_size"]) if row["local_size"] else "-"),
@@ -401,41 +567,65 @@ def render_report(snapshot):
     leftover_rows = []
     for item in snapshot["leftovers"]:
         leftover_rows.append(
-            "<li>%s (%s)</li>" % (html.escape(item["name"]), html.escape(human_size(item["size"])))
+            "<li>%s <span class=\"muted\">(%s)</span></li>"
+            % (html.escape(item["name"]), html.escape(human_size(item["size"])))
         )
-    remote_note = "" if snapshot["remote_ok"] else "<p>فهرست مقصد خوانده نشد، پس تعداد منتقل‌شده کامل نیست.</p>"
-    if snapshot["status"] == "CRITICAL":
-        remote_note += "<p>انتقال فولدر system برای این روز تمام و تأیید نشده است.</p>"
-    if snapshot.get("db_note"):
-        remote_note += "<p>%s</p>" % html.escape(snapshot["db_note"])
-    return """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><style>
-    body{font-family:Tahoma,Arial,sans-serif;margin:32px} .ok{background:#e8f5e9} .warning{background:#fff8e1} .problem{background:#ffebee}
-    .ok,.warning,.problem{padding:12px;border-radius:6px}
-    table{border-collapse:collapse;width:100%%;margin-top:20px}th,td{border:1px solid #ddd;padding:8px;text-align:right}
-    tr.bad td{background:#ffebee} tr.good td{background:#f7fff7}
-    </style></head><body>
-    <h1>گزارش بکاپ پارس‌پک</h1>
-    <div class="%s"><strong>وضعیت: %s</strong></div>
-    %s
-    <h2>خلاصه %s</h2>
-    <p>حساب‌های دیده‌شده در مبدأ و مقصد: %d<br>
-    منتقل‌شده به مقصد: %d<br>
-    منتقل‌نشده: %d<br>
-    حجم منتقل‌شده: %s<br>
-    حجم مانده در مبدأ: %s<br>
-    شروع: %s<br>
-    پایان: %s</p>
-    <h2>فایل‌های اضافی مقصد</h2>
-    <ul>%s</ul>
-    <table><tr><th>حساب</th><th>وضعیت</th><th>حجم مقصد</th><th>حجم مبدأ</th><th>آخرین زمان</th><th>توضیح</th></tr>
-    %s</table></body></html>""" % (
+    notes = []
+    if not snapshot["remote_ok"]:
+        notes.append("فهرست مقصد خوانده نشد، پس تعداد منتقل‌شده کامل نیست.")
+    cause = snapshot.get("status_note") or status_cause_fa(snapshot["status"], snapshot.get("db_note") or "")
+    if cause:
+        notes.append(cause)
+    note_html = "".join("<p class=\"note\">%s</p>" % html.escape(item) for item in notes)
+    return """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>گزارش بکاپ %s</title>
+<style>
+body{font-family:Tahoma,Arial,sans-serif;margin:0;padding:24px;background:#f4f7fb;color:#1f2933;line-height:1.7}
+.wrap{max-width:920px;margin:0 auto;background:#fff;border:1px solid #d9e2ec;border-radius:12px;overflow:hidden}
+.header{padding:20px 24px;border-bottom:1px solid #e4ebf2}
+.header h1{margin:0 0 6px;font-size:22px}
+.header .day{color:#627d98;font-size:14px}
+.banner{padding:14px 24px;font-size:15px}
+.ok{background:#e8f5e9;color:#1b5e20}.warning{background:#fff8e1;color:#8d6b00}.problem{background:#ffebee;color:#9b1c1c}
+.section{padding:18px 24px;border-top:1px solid #eef2f5}
+.section h2{margin:0 0 12px;font-size:16px}
+.grid{display:flex;flex-wrap:wrap;gap:10px}
+.stat{flex:1 1 140px;background:#f7f9fb;border:1px solid #e4ebf2;border-radius:10px;padding:12px}
+.stat .k{display:block;color:#627d98;font-size:12px;margin-bottom:4px}
+.stat .v{display:block;font-size:18px;font-weight:bold}
+.stat .s{display:block;color:#627d98;font-size:12px;margin-top:4px}
+.note{margin:0 0 8px;padding:10px 12px;background:#f7f9fb;border-right:3px solid #486581;border-radius:6px}
+table{border-collapse:collapse;width:100%%}th,td{border:1px solid #e4ebf2;padding:8px 10px;text-align:right;font-size:13px}
+th{background:#f7f9fb;color:#486581}tr.bad td{background:#fff5f5}tr.good td{background:#f8fff8}
+ul{margin:0;padding:0 18px 0 0}.muted{color:#829ab1}
+</style></head><body><div class="wrap">
+<div class="header"><h1>گزارش بکاپ پارس‌پک</h1><div class="day">روز %s</div></div>
+<div class="banner %s"><strong>وضعیت: %s</strong></div>
+<div class="section">%s
+<div class="grid">
+<div class="stat"><span class="k">حساب‌های منتقل‌شده</span><span class="v">%d / %d</span><span class="s">فایل‌های accounts — منتقل‌نشده: %d</span></div>
+<div class="stat"><span class="k">کل فایل‌های منتقل‌شده</span><span class="v">%d / %d</span><span class="s">accounts + system (system: %d / %d)</span></div>
+<div class="stat"><span class="k">حجم منتقل‌شده</span><span class="v">%s</span><span class="s">مانده در مبدأ: %s</span></div>
+<div class="stat"><span class="k">بازه زمانی</span><span class="v" style="font-size:14px">%s</span><span class="s">تا %s</span></div>
+</div></div>
+<div class="section"><h2>فایل‌های اضافی مقصد</h2><ul>%s</ul></div>
+<div class="section"><h2>جزئیات حساب‌ها</h2>
+<table><tr><th>حساب</th><th>وضعیت</th><th>حجم مقصد</th><th>حجم مبدأ</th><th>آخرین زمان</th><th>توضیح</th></tr>
+%s</table></div>
+</div></body></html>""" % (
+        html.escape(snapshot["date"]),
+        html.escape(snapshot["date"]),
         status_class,
         html.escape(status_text),
-        remote_note,
-        html.escape(snapshot["date"]),
-        snapshot["source_count"],
-        snapshot["transferred_count"],
-        snapshot["failed_count"],
+        note_html,
+        account_transferred,
+        account_expected,
+        account_failed,
+        files_transferred,
+        files_expected,
+        system_transferred,
+        system_expected,
         html.escape(human_size(snapshot["transferred_bytes"])),
         html.escape(human_size(snapshot["remaining_bytes"])),
         html.escape(snapshot["started"] or "-"),
@@ -443,6 +633,7 @@ def render_report(snapshot):
         "".join(leftover_rows) or "<li>ندارد</li>",
         "".join(body) or "<tr><td colspan=\"6\">حسابی پیدا نشد</td></tr>",
     )
+
 
 
 def log_status_rows(conf, day):
@@ -526,7 +717,11 @@ def dashboard_cli():
         raise parspack_config.ConfigError("report date must look like YYYY-MM-DD")
     roots = parspack_config.split_roots(conf["LOCAL_READ_ROOTS"])
     days = sorted(set(list_history_days(conf)) | set(discover_dates(roots)))
+    # Newest last in sorted list; keep only the last 10 calendar days that exist.
+    days = days[-10:] if len(days) > 10 else days
     day = requested or (days[-1] if days else "")
+    if day and days and day not in days:
+        day = days[-1]
     report = None
     if day:
         path = os.path.join(conf["STATE_DIR"], "history", day + ".json")
@@ -548,14 +743,32 @@ def dashboard_cli():
             for item in saved.get("leftovers") or []:
                 if isinstance(item, str):
                     leftovers.append(item)
+            note = str(saved.get("status_note") or saved.get("db_note") or "")
+            source_count = saved.get("source_count") if isinstance(saved.get("source_count"), int) else len(rows)
+            transferred_count = saved.get("transferred_count") if isinstance(saved.get("transferred_count"), int) else 0
+            failed_count = saved.get("failed_count") if isinstance(saved.get("failed_count"), int) else 0
+            account_expected = saved.get("account_expected") if isinstance(saved.get("account_expected"), int) else source_count
+            account_transferred = saved.get("account_transferred") if isinstance(saved.get("account_transferred"), int) else transferred_count
+            account_failed = saved.get("account_failed") if isinstance(saved.get("account_failed"), int) else failed_count
+            system_expected = saved.get("system_expected") if isinstance(saved.get("system_expected"), int) else 0
+            system_transferred = saved.get("system_transferred") if isinstance(saved.get("system_transferred"), int) else 0
+            files_expected = saved.get("files_expected") if isinstance(saved.get("files_expected"), int) else (account_expected + system_expected)
+            files_transferred = saved.get("files_transferred") if isinstance(saved.get("files_transferred"), int) else (account_transferred + system_transferred)
             report = {
                 "date": str(saved.get("date") or day),
                 "status": saved.get("status") if saved.get("status") in ("OK", "WARNING", "PROBLEM", "CRITICAL", "EMPTY") else "EMPTY",
                 "remote_ok": saved.get("remote_ok") if isinstance(saved.get("remote_ok"), bool) else None,
                 "source": "history",
-                "source_count": saved.get("source_count") if isinstance(saved.get("source_count"), int) else len(rows),
-                "transferred_count": saved.get("transferred_count") if isinstance(saved.get("transferred_count"), int) else 0,
-                "failed_count": saved.get("failed_count") if isinstance(saved.get("failed_count"), int) else 0,
+                "source_count": source_count,
+                "transferred_count": transferred_count,
+                "failed_count": failed_count,
+                "account_expected": account_expected,
+                "account_transferred": account_transferred,
+                "account_failed": account_failed,
+                "system_expected": system_expected,
+                "system_transferred": system_transferred,
+                "files_expected": files_expected,
+                "files_transferred": files_transferred,
                 "transferred_bytes": saved.get("transferred_bytes") if isinstance(saved.get("transferred_bytes"), int) else 0,
                 "remaining_bytes": saved.get("remaining_bytes") if isinstance(saved.get("remaining_bytes"), int) else 0,
                 "started": str(saved.get("started") or ""),
@@ -563,11 +776,49 @@ def dashboard_cli():
                 "checked_at": checked,
                 "rows": rows,
                 "leftovers": leftovers,
+                "status_note": note,
+                "db_note": note,
+                "accounts_complete": bool(saved.get("accounts_complete")),
+                "system_pending": bool(saved.get("system_pending")),
             }
         else:
             report = log_status_rows(conf, day)
-    if report is not None and day in parspack_config.pending_system_days(conf["STATE_DIR"]):
-        report["status"] = "CRITICAL"
+    if report is not None:
+        if day in parspack_config.pending_system_days(conf["STATE_DIR"]):
+            report["status"] = "CRITICAL"
+            report["system_pending"] = True
+            transferred = int(report.get("transferred_count") or 0)
+            source = int(report.get("source_count") or 0)
+            failed = int(report.get("failed_count") or 0)
+            accounts_complete = failed == 0 and transferred > 0 and transferred >= source
+            report["accounts_complete"] = accounts_complete
+            if accounts_complete:
+                note = (
+                    "حساب‌های کاربری منتقل شده‌اند، ولی پوشه system و "
+                    "manifest.json هنوز تمام و تأیید نشده‌اند. برای تکمیل روز "
+                    "از ارسال مانده‌ها استفاده کنید."
+                )
+                existing = str(report.get("db_note") or report.get("status_note") or "")
+                if note not in existing:
+                    report["status_note"] = (note + " " + existing).strip()
+                else:
+                    report["status_note"] = existing or note
+                report["db_note"] = report["status_note"]
+            else:
+                report["status_note"] = status_cause_fa("CRITICAL", report.get("db_note") or "")
+        elif day in parspack_config.retention_failed_days(conf["STATE_DIR"]):
+            if report.get("status") == "OK":
+                report["status"] = "WARNING"
+            note = report.get("status_note") or ""
+            retention_msg = (
+                "پاک‌سازی بکاپ‌های قدیمی مقصد (پنجرهٔ نگهداری) تمام نشد؛ "
+                "انتقال این روز انجام شده است."
+            )
+            if retention_msg not in note:
+                report["status_note"] = (note + " " + retention_msg).strip()
+                report["db_note"] = report["status_note"]
+        elif not report.get("status_note"):
+            report["status_note"] = status_cause_fa(report.get("status") or "", report.get("db_note") or "")
     document = {
         "mode": conf["MODE"],
         "bucket": conf["PARSPACK_BUCKET"],
@@ -605,27 +856,32 @@ def main():
         "run_state": "",
         "pending": snapshot["status"] == "CRITICAL",
         "remote_ok": snapshot["remote_ok"],
+        "accounts_ok": int(snapshot.get("account_transferred") or snapshot["transferred_count"] or 0),
+        "accounts_failed": int(snapshot.get("account_failed") or snapshot["failed_count"] or 0),
+        "accounts_complete": bool(snapshot.get("accounts_complete")),
     }
     try:
-        import parspack_ui
         db_path = os.path.join(conf["STATE_DIR"], "parspack.db")
+        pending_days = parspack_config.pending_system_days(conf["STATE_DIR"])
+        retention_days = parspack_config.retention_failed_days(conf["STATE_DIR"])
         view = parspack_ui.dashboard_from_db(
             parspack_ui.connect_readonly(db_path),
             day,
-            [],
+            ["system-pending-%s" % item for item in pending_days],
             parspack_ui._secrets(raw),
+            retention_days,
         )
         facts = dict(view.get("facts") or facts)
         facts["remote_ok"] = snapshot["remote_ok"]
         if snapshot["status"] == "CRITICAL":
             facts["pending"] = True
+        facts["retention_failed"] = day in retention_days
+        facts["accounts_complete"] = bool(snapshot.get("accounts_complete"))
     except Exception:
-        import parspack_ui
+        facts["retention_failed"] = day in parspack_config.retention_failed_days(conf["STATE_DIR"])
+        facts["accounts_complete"] = bool(snapshot.get("accounts_complete"))
     decision = parspack_ui.classify_alerts(snapshot, facts, int(raw.get("ALERT_REMOTE_BYTES") or 0))
-    extra = parspack_ui.summary_text(
-        day, decision["severity"], snapshot["rows"], facts, parspack_ui._secrets(raw)
-    )
-    report = render_report(snapshot) + "\n<pre>%s</pre>\n" % html.escape(extra)
+    report = render_report(snapshot)
     path = os.path.join(reports, "%s.html" % day)
     write_private(path, report)
     public = {
@@ -634,6 +890,13 @@ def main():
         "source_count": snapshot["source_count"],
         "transferred_count": snapshot["transferred_count"],
         "failed_count": snapshot["failed_count"],
+        "account_expected": snapshot.get("account_expected", snapshot["source_count"]),
+        "account_transferred": snapshot.get("account_transferred", snapshot["transferred_count"]),
+        "account_failed": snapshot.get("account_failed", snapshot["failed_count"]),
+        "system_expected": snapshot.get("system_expected", 0),
+        "system_transferred": snapshot.get("system_transferred", 0),
+        "files_expected": snapshot.get("files_expected", snapshot["source_count"]),
+        "files_transferred": snapshot.get("files_transferred", snapshot["transferred_count"]),
         "transferred_bytes": snapshot["transferred_bytes"],
         "remaining_bytes": snapshot["remaining_bytes"],
         "started": snapshot["started"],
@@ -643,6 +906,10 @@ def main():
         "leftovers": [item["name"] for item in snapshot["leftovers"]],
         "accounts": public_account_rows(snapshot["rows"]),
         "checked_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "status_note": snapshot.get("status_note") or "",
+        "db_note": snapshot.get("db_note") or "",
+        "accounts_complete": bool(snapshot.get("accounts_complete")),
+        "system_pending": bool(snapshot.get("system_pending")),
     }
     write_private(os.path.join(history, "%s.json" % day), json.dumps(public, ensure_ascii=False, indent=2))
     subjects = {

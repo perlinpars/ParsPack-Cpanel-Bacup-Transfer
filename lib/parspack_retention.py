@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guards for cPanel-driven delete and rmdir. This program never schedules a delete."""
+"""Guards for remote delete. Age prune runs only when this program is called with --apply."""
 
 from __future__ import print_function
 
@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 
 ROOT = os.path.realpath(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -66,11 +67,58 @@ def authorize(conf, relative, kind, today, newest_verified):
         raise RetentionError("refused: newest verified day is unknown")
     if day == newest_verified:
         raise RetentionError("refused: newest verified day")
+    keep_days = keep_days_of(conf)
+    if keep_days and day >= keep_cutoff(today, keep_days):
+        raise RetentionError("refused: inside the keep window")
     return day
 
 
+def keep_days_of(conf):
+    """Days kept backward from today. 0 means this program does not prune by age."""
+    raw = conf.get("REMOTE_KEEP_DAYS", "0")
+    if raw in ("", None):
+        return 0
+    if not isinstance(raw, str) or not re.fullmatch(r"0|[1-9][0-9]{0,3}", raw):
+        return 0
+    number = int(raw)
+    if number > 3650:
+        return 0
+    return number
+
+
+def keep_cutoff(today, keep_days):
+    """Oldest date that stays. A folder older than this date can be removed."""
+    year, month, day = (int(part) for part in today.split("-"))
+    current = datetime.date(year, month, day)
+    return (current - datetime.timedelta(days=int(keep_days))).isoformat()
+
+
+def plan_keep_window(days, today, keep_days, newest_verified):
+    """Date folders older than the keep window. This plans only.
+
+    The window is inclusive: 10 keeps today and the ten days before it.
+    Today and the newest verified day are never in the result. An unknown
+    newest day removes nothing.
+    """
+    ordered = sorted({day for day in days if valid_day(day)})
+    if not keep_days:
+        return [], "keep days is 0"
+    if not newest_verified:
+        return [], "newest verified day is unknown"
+    cutoff = keep_cutoff(today, keep_days)
+    remove = [
+        day for day in ordered
+        if day < cutoff and day != today and day != newest_verified
+    ]
+    return remove, "ok"
+
+
 def newest_verified_day(db_path):
-    """Return the newest day with a verified object, or None when that cannot be known."""
+    """Return the newest day with a verified object, or None when that cannot be known.
+
+    Falls back to the newest backup_days row marked complete when upload rows
+    are missing (older installs / restored state).
+    """
     try:
         import parspack_ui
         conn = parspack_ui.connect_readonly(db_path)
@@ -82,12 +130,26 @@ def newest_verified_day(db_path):
             "ORDER BY backup_date DESC LIMIT 1" % ",".join("?" for _ in SUCCESS_STATUSES),
             SUCCESS_STATUSES,
         ).fetchone()
+        if row is not None:
+            day = row["backup_date"] or ""
+            if valid_day(day):
+                return day
+        row = conn.execute(
+            "SELECT backup_date FROM backup_days WHERE run_state = 'complete' "
+            "ORDER BY backup_date DESC LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            day = row["backup_date"] or ""
+            if valid_day(day):
+                return day
     except Exception:
         return None
-    if row is None:
-        return None
-    day = row["backup_date"] or ""
-    return day if valid_day(day) else None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return None
 
 
 def keys_from_listing(text):
@@ -116,6 +178,28 @@ def keys_from_listing(text):
             raise RetentionError("refused: listing could not be parsed")
         found.append((key, size))
     return found
+
+
+def days_from_prefix_listing(text):
+    """Date folders from a non-recursive mc ls --json of the prefix."""
+    days = []
+    for raw in (text or "").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise RetentionError("refused: listing could not be parsed")
+        if not isinstance(data, dict) or data.get("status") == "error":
+            raise RetentionError("refused: listing could not be parsed")
+        key = str(data.get("key") or data.get("name") or "").replace("\\", "/").strip("/")
+        if not key or ".." in key.split("/"):
+            raise RetentionError("refused: listing could not be parsed")
+        leaf = key.split("/")[-1]
+        if valid_day(leaf):
+            days.append(leaf)
+    return sorted(set(days))
 
 
 def confirm_listing(relative, text):
@@ -229,7 +313,7 @@ def usage_bytes(entries):
     return total
 
 
-def dry_run_lines(entries, whm, today, newest, threshold):
+def dry_run_lines(entries, whm, today, newest, threshold, keep_days=0):
     """Text report. No line is a delete command."""
     days = sorted({day for day, _size in entries if valid_day(day)})
     verified = [newest] if newest else []
@@ -257,6 +341,15 @@ def dry_run_lines(entries, whm, today, newest, threshold):
             lines.append("guard-keep %s %s" % (day, block))
     over = any(item["text"] == "recorded remote usage is over the threshold" for item in warning["warnings"])
     lines.append("storage-warning %s" % ("yes" if over else "no"))
+    age_remove, age_reason = plan_keep_window(days, today, keep_days, newest)
+    lines.append("keep-days %s" % (int(keep_days) if keep_days else 0))
+    if keep_days:
+        lines.append("keep-cutoff %s" % keep_cutoff(today, keep_days))
+    lines.append("age-note %s" % age_reason)
+    if not age_remove:
+        lines.append("age-remove none")
+    for day in age_remove:
+        lines.append("age-remove %s" % day)
     return lines
 
 
@@ -266,14 +359,17 @@ def cmd_check(conf, relative, kind):
     authorize(conf, relative, kind, today, newest)
 
 
-def cmd_dry_run(conf, listing_text, whm_text):
+def cmd_dry_run(conf, listing_or_entries, whm_text, from_days=False):
     if not parspack_config.sanitize_remote(conf.get("PARSPACK_PREFIX", ""), allow_empty=True):
         raise RetentionError("refused: empty prefix")
-    entries = []
-    for key, size in keys_from_listing(listing_text):
-        day = key.split("/")[0]
-        if valid_day(day):
-            entries.append((day, size))
+    if from_days:
+        entries = list(listing_or_entries or [])
+    else:
+        entries = []
+        for key, size in keys_from_listing(listing_or_entries):
+            day = key.split("/")[0]
+            if valid_day(day):
+                entries.append((day, size))
     newest = newest_verified_day(os.path.join(conf["STATE_DIR"], "parspack.db"))
     whm = parse_whm_retention(whm_text)
     lines = dry_run_lines(
@@ -282,26 +378,101 @@ def cmd_dry_run(conf, listing_text, whm_text):
         datetime.date.today().isoformat(),
         newest,
         conf.get("ALERT_REMOTE_BYTES") or "0",
+        keep_days_of(conf),
     )
     sys.stdout.write("\n".join(lines) + "\n")
 
 
+def remove_day_folder(day):
+    """Delete one date folder through the guarded remote operation."""
+    if not valid_day(day):
+        raise RetentionError("refused: not a date folder")
+    script = os.path.join(ROOT, "bin", "remote-ops.sh")
+    proc = subprocess.run(
+        [script, "rmdir", day],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=300,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = ""
+        for line in reversed((proc.stderr or "").splitlines()):
+            detail = line.strip()
+            if detail:
+                break
+        if not detail.startswith("refused:"):
+            detail = "refused: remote delete failed"
+        raise RetentionError(detail[:200])
+
+
+def apply_keep_window(conf, days, remove_day):
+    """Remove date folders older than REMOTE_KEEP_DAYS. A zero count removes nothing."""
+    if conf.get("MODE") != "PRODUCTION" or conf.get("ALLOW_REMOTE_DELETE") != "1":
+        raise RetentionError("refused: remote delete disabled")
+    if not parspack_config.sanitize_remote(conf.get("PARSPACK_PREFIX", ""), allow_empty=True):
+        raise RetentionError("refused: empty prefix")
+    keep_days = keep_days_of(conf)
+    today = datetime.date.today().isoformat()
+    if not keep_days:
+        return ["keep-days 0", "age-remove none"]
+    newest = newest_verified_day(os.path.join(conf["STATE_DIR"], "parspack.db"))
+    remove, reason = plan_keep_window(days, today, keep_days, newest)
+    lines = [
+        "keep-days %d" % keep_days,
+        "keep-cutoff %s" % keep_cutoff(today, keep_days),
+        "age-note %s" % reason,
+    ]
+    if reason != "ok" or not remove:
+        lines.append("age-remove none")
+        return lines
+    for day in remove:
+        remove_day(day)
+        lines.append("age-remove %s" % day)
+    return lines
+
+
+def list_remote_days(conf):
+    """Non-recursive prefix listing. Avoids timing out on a full recursive walk."""
+    import parspack_ops
+    target = parspack_config.object_target(conf, "", allow_empty=True)
+    try:
+        code, out, _err = parspack_ops._default_mc(
+            conf, ["ls", "--json", "--", target + "/"], timeout=120
+        )
+    except subprocess.TimeoutExpired:
+        raise RetentionError("refused: remote listing timed out")
+    if code != 0:
+        # Some mc builds want the prefix without a trailing slash.
+        try:
+            code, out, _err = parspack_ops._default_mc(
+                conf, ["ls", "--json", "--", target], timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            raise RetentionError("refused: remote listing timed out")
+    if code != 0:
+        raise RetentionError("refused: remote listing failed")
+    return days_from_prefix_listing(out)
+
+
 def main(argv):
     parspack_config.require_root()
-    if list(argv) != ["--dry-run"]:
-        print("usage: retention --dry-run", file=sys.stderr)
+    if list(argv) not in (["--dry-run"], ["--apply"]):
+        print("usage: retention --dry-run|--apply", file=sys.stderr)
         return 2
     conf = parspack_config.load_valid()
     prefix = parspack_config.sanitize_remote(conf.get("PARSPACK_PREFIX", ""), allow_empty=True)
     if not prefix:
         print("refused: empty prefix", file=sys.stderr)
         return 1
-    import parspack_ops
-    target = parspack_config.object_target(conf, "", allow_empty=True)
-    code, out, _err = parspack_ops._default_mc(conf, ["ls", "--recursive", "--json", "--", target])
-    if code != 0:
-        print("refused: remote listing failed", file=sys.stderr)
-        return 1
+    if list(argv) == ["--apply"]:
+        if conf.get("MODE") != "PRODUCTION" or conf.get("ALLOW_REMOTE_DELETE") != "1":
+            print("refused: remote delete disabled", file=sys.stderr)
+            return 1
+        if keep_days_of(conf) == 0:
+            sys.stdout.write("keep-days 0\nage-remove none\n")
+            return 0
     whm_text = ""
     if os.path.isfile(WHM_CONFIG) and not os.path.islink(WHM_CONFIG):
         try:
@@ -309,7 +480,15 @@ def main(argv):
         except OSError:
             whm_text = ""
     try:
-        cmd_dry_run(conf, out, whm_text)
+        days = list_remote_days(conf)
+        if list(argv) == ["--apply"]:
+            lines = apply_keep_window(conf, days, remove_day_folder)
+            sys.stdout.write("\n".join(lines) + "\n")
+        else:
+            # Day folders only; byte totals are optional and must not require a
+            # full recursive walk of every object in the bucket.
+            entries = [(day, 0) for day in days]
+            cmd_dry_run(conf, entries, whm_text, from_days=True)
     except RetentionError as exc:
         print(exc.message, file=sys.stderr)
         return 1
@@ -324,4 +503,7 @@ if __name__ == "__main__":
         sys.exit(2)
     except RetentionError as exc:
         print(exc.message, file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("refused: remote listing timed out", file=sys.stderr)
         sys.exit(1)

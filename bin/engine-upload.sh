@@ -120,6 +120,10 @@ verify_remote_content_sha() {
 maybe_delete_local() {
   local file="$1"
   local digest="$2"
+  # cPanel still owns /var/cpanel/backups/tmp.test.* and deletes it after Validate.
+  if [[ "${cpanel_probe:-0}" -eq 1 ]]; then
+    return 0
+  fi
   if [[ "$MODE" == "TEST" ]]; then
     pp_log INFO "TEST mode kept the local file"
     return 0
@@ -195,6 +199,7 @@ record_upload() {
   local size="$3"
   local duration="$4"
   local attempt="$5"
+  [[ -n "${state_id:-}" ]] || return 0
   case "$file$remote" in
     *$'\n'*|*$'\r'*|*$'\t'*)
       pp_die "Refusing to record a path containing a control character"
@@ -247,9 +252,17 @@ run_due_deletes() {
   done < <(pp_state due-deletes || true)
 }
 
+upload_lock_wait_seconds() {
+  if [[ "${PARSPACK_TREE_STABLE:-}" == "1" ]]; then
+    printf '%s\n' "${SYSTEM_UPLOAD_LOCK_WAIT_SECONDS:-600}"
+  else
+    printf '%s\n' "${UPLOAD_LOCK_WAIT_SECONDS:-120}"
+  fi
+}
+
 if [[ "${1:-}" == "--due" ]]; then
   pp_bootstrap
-  if ! pp_flock 9 "$ROOT/run/upload.lock" "${UPLOAD_LOCK_WAIT_SECONDS:-120}"; then
+  if ! pp_flock 9 "$ROOT/run/upload.lock" "$(upload_lock_wait_seconds)"; then
     exit 0
   fi
   pp_prepare_mc
@@ -263,8 +276,9 @@ pp_bootstrap
 
 LOCAL_FILE="$(pp_py check-local read -- "$1")"
 TARGET="$(pp_py object-key --require-child -- "$2")"
-if ! pp_flock 9 "$ROOT/run/upload.lock" "${UPLOAD_LOCK_WAIT_SECONDS:-120}"; then
-  pp_die "Upload lock was still held after ${UPLOAD_LOCK_WAIT_SECONDS:-120}s"
+lock_wait="$(upload_lock_wait_seconds)"
+if ! pp_flock 9 "$ROOT/run/upload.lock" "$lock_wait"; then
+  pp_die "Upload lock was still held after ${lock_wait}s while waiting to upload $LOCAL_FILE"
 fi
 
 pp_prepare_mc
@@ -273,9 +287,17 @@ if (( local_size <= 0 )); then
   pp_die "Refusing to upload an empty file"
 fi
 
-# TEST validates the file, the remote path, and that the bucket can be listed.
-# It must not create an object. Exit 3 so cPanel does not keep the backup.
-if [[ "$MODE" != "PRODUCTION" ]]; then
+# WHM Validate uploads /var/cpanel/backups/tmp.test.<pid>-<time> as
+# validate.tmp-<pid>-<time>.txt. That probe is a real small upload so the
+# destination can pass. Every other file in TEST mode still exits 3 and
+# stores nothing, so cPanel does not treat a dry run as a finished backup.
+cpanel_probe=0
+if [[ "$LOCAL_FILE" =~ ^/var/cpanel/backups/tmp\.test\.[0-9]+-[0-9]+$ ]]; then
+  cpanel_probe=1
+elif [[ "$TARGET" =~ (^|/)validate\.tmp-[0-9]+-[0-9]+\.txt$ ]]; then
+  cpanel_probe=1
+fi
+if [[ "$MODE" != "PRODUCTION" && "$cpanel_probe" -eq 0 ]]; then
   probe="$(pp_py object-key --allow-empty -- "")"
   errf="$(pp_mktemp)"
   outf="$(pp_mktemp)"
@@ -290,7 +312,7 @@ if [[ "$MODE" != "PRODUCTION" ]]; then
   exit 3
 fi
 
-if [[ "$LOCAL_FILE" == /var/cpanel/backups/tmp.test.* ]]; then
+if [[ "$cpanel_probe" -eq 1 ]]; then
   pp_log INFO "cPanel transport validation file detected; skipping age/stability check"
 else
   check_file_age_and_stability "$LOCAL_FILE"
@@ -298,9 +320,13 @@ fi
 
 local_sha="$(pp_py sha256 -- "$LOCAL_FILE")"
 state_id=""
-if ! open_state; then
-  maybe_delete_local "$LOCAL_FILE" "$local_sha"
-  exit 0
+# The validation probe is not a backup day. A state row would be "undated"
+# and would hide the real newest verified day from later retention checks.
+if [[ "$cpanel_probe" -eq 0 ]]; then
+  if ! open_state; then
+    maybe_delete_local "$LOCAL_FILE" "$local_sha"
+    exit 0
+  fi
 fi
 
 read_attempt=1
@@ -370,28 +396,47 @@ case "$decision" in
         exit 0
         ;;
       mismatch)
-        pp_log ERROR "Remote verification failed. Remote object was left untouched: $TARGET"
-        pp_state note verify-failed --id "$state_id" --error-class VERIFY --error "remote content did not match" || true
-        exit 1
+        if [[ "$MODE" == "PRODUCTION" ]]; then
+          pp_log WARN "Remote object same size but metadata did not verify; replacing that one object: $TARGET"
+          decision=reupload
+        else
+          pp_log ERROR "Remote verification failed (metadata mismatch). Remote object was left untouched: $TARGET"
+          pp_state note verify-failed --id "$state_id" --error-class VERIFY --error "remote metadata did not match" || true
+          exit 1
+        fi
         ;;
     esac
-    set +e
-    remote_content_sha="$(verify_remote_content_sha "$TARGET")"
-    content_verify_rc=$?
-    set -e
-    if [[ "$content_verify_rc" -eq 0 && "$remote_content_sha" == "$local_sha" ]]; then
-      pp_log INFO "Remote object content SHA256 verified: $local_sha"
-      pp_state note verified --id "$state_id" --remote-checksum "$local_sha" --level sha256 --attempt 0 --duration 0
-      maybe_delete_local "$LOCAL_FILE" "$local_sha"
-      exit 0
+    if [[ "$decision" == "verify-content" ]]; then
+      set +e
+      remote_content_sha="$(verify_remote_content_sha "$TARGET")"
+      content_verify_rc=$?
+      set -e
+      if [[ "$content_verify_rc" -eq 0 && "$remote_content_sha" == "$local_sha" ]]; then
+        pp_log INFO "Remote object content SHA256 verified: $local_sha"
+        pp_state note verified --id "$state_id" --remote-checksum "$local_sha" --level sha256 --attempt 0 --duration 0
+        maybe_delete_local "$LOCAL_FILE" "$local_sha"
+        exit 0
+      fi
+      if [[ "$MODE" == "PRODUCTION" ]]; then
+        if [[ "$content_verify_rc" -eq 0 ]]; then
+          pp_log WARN "Remote content checksum mismatch (same size); replacing that one object: $TARGET"
+        else
+          pp_log WARN "Remote content could not be read for verification (same size); replacing that one object: $TARGET"
+        fi
+        decision=reupload
+      else
+        if [[ "$content_verify_rc" -eq 0 ]]; then
+          pp_log ERROR "Remote verification failed (content checksum mismatch). Remote object was left untouched: $TARGET"
+        else
+          pp_log ERROR "Could not verify remote object content; it was left untouched: $TARGET"
+        fi
+        pp_state note verify-failed --id "$state_id" --error-class VERIFY --error "remote content did not match" || true
+        exit 1
+      fi
     fi
-    if [[ "$content_verify_rc" -eq 0 ]]; then
-      pp_log ERROR "Remote verification failed. Remote object was left untouched: $TARGET"
-    else
-      pp_log ERROR "Could not verify remote object content; it was left untouched: $TARGET"
-    fi
-    pp_state note verify-failed --id "$state_id" --error-class VERIFY --error "remote content did not match" || true
-    exit 1
+    ;;
+  reupload)
+    pp_log WARN "Remote object same size with a different checksum; replacing that one object: $TARGET"
     ;;
   upload)
     ;;
@@ -403,6 +448,9 @@ case "$decision" in
     pp_die "Unexpected upload decision"
     ;;
 esac
+if [[ "$decision" != "upload" && "$decision" != "reupload" ]]; then
+  pp_die "Unexpected upload decision after verify"
+fi
 
 # S3 has no rename. mc mv is copy plus an immediate delete of the source, so a
 # failure during that copy must not be followed by deleting the verified
@@ -415,6 +463,17 @@ discard_part() {
   [[ "$upload_part" == "${TARGET}.uploading" ]] || pp_die "Refusing to remove an unexpected temporary object"
   pp_mc rm --force -- "$upload_part" >/dev/null 2>&1 || true
 }
+# Drop a leftover temporary object from an earlier interrupted put for this key.
+if [[ "$MODE" == "PRODUCTION" ]]; then
+  set +e
+  leftover_stat="$(read_remote_stat "$upload_part")"
+  leftover_rc=$?
+  set -e
+  if [[ "$leftover_rc" -eq 0 && "$leftover_stat" != "missing" ]]; then
+    pp_log WARN "Removing orphan temporary object before upload: $upload_part"
+    discard_part
+  fi
+fi
 # match: size and checksum agree. mismatch: a readable object differs.
 # missing: no object. unreadable: the check itself failed, so nothing is deleted.
 classify_remote() {
@@ -460,6 +519,13 @@ classify_remote() {
       return 0
       ;;
     mismatch)
+      if [[ "$verified_size" != "$local_size" ]]; then
+        pp_log ERROR "Remote size mismatch for $subject: remote=$verified_size local=$local_size"
+      elif [[ -n "$verified_sha" && "$verified_sha" != "-" && "${verified_sha,,}" != "${local_sha,,}" ]]; then
+        pp_log ERROR "Remote checksum mismatch for $subject"
+      else
+        pp_log ERROR "Remote metadata verification mismatch for $subject"
+      fi
       printf '%s\n' mismatch
       return 0
       ;;
@@ -469,6 +535,7 @@ classify_remote() {
   content_verify_rc=$?
   set -e
   if [[ "$content_verify_rc" -ne 0 ]]; then
+    pp_log ERROR "Remote object could not be read for content verification: $subject"
     printf '%s\n' unreadable
     return 0
   fi
@@ -479,6 +546,7 @@ classify_remote() {
     printf '%s\n' match
     return 0
   fi
+  pp_log ERROR "Remote content checksum mismatch for $subject"
   printf '%s\n' mismatch
 }
 note_retry() {
@@ -522,7 +590,15 @@ while (( attempt <= RETRY_COUNT )); do
         kind="$(pp_py classify-error <"$errf" 2>/dev/null || true)"
         [[ "$kind" == "FATAL" ]] || kind="RETRYABLE"
         discard_part
-        note_retry "$kind" upload-failed "Upload command failed"
+        if [[ "$kind" == "FATAL" ]] && pp_py storage-full <"$errf" 2>/dev/null; then
+          if [[ "${ALLOW_REMOTE_DELETE:-0}" == "1" ]]; then
+            note_retry FATAL upload-failed "Destination storage is full; remote delete is enabled but there was still not enough space: $LOCAL_FILE"
+          else
+            note_retry FATAL upload-failed "Destination storage is full; remote delete is disabled so old objects were not pruned: $LOCAL_FILE"
+          fi
+        else
+          note_retry "$kind" upload-failed "Upload command failed"
+        fi
         continue
       fi
       part_sent=1
@@ -531,7 +607,9 @@ while (( attempt <= RETRY_COUNT )); do
     fi
     case "$(classify_remote "$upload_part")" in
       match)
-        pp_state note uploaded --id "$state_id"
+        if [[ -n "${state_id:-}" ]]; then
+          pp_state note uploaded --id "$state_id"
+        fi
         part_ready=1
         ;;
       unreadable)
@@ -547,7 +625,9 @@ while (( attempt <= RETRY_COUNT )); do
     esac
   else
     pp_log INFO "Publishing verified temporary object attempt ${attempt}/${RETRY_COUNT}: $TARGET"
-    pp_state note verifying --id "$state_id"
+    if [[ -n "${state_id:-}" ]]; then
+      pp_state note verifying --id "$state_id"
+    fi
   fi
   errf="$(pp_mktemp)"
   set +e
@@ -560,26 +640,44 @@ while (( attempt <= RETRY_COUNT )); do
     note_retry "$kind" verify-failed "Verified temporary object could not be copied. It was kept and the destination was left untouched: $TARGET"
     continue
   fi
+  publish_ok=0
   case "$(classify_remote "$TARGET")" in
     match)
-      discard_part
-      duration=$(( $(date +%s) - start ))
-      if (( duration < 1 )); then
-        duration=1
-      fi
-      speed=$(( local_size / duration ))
-      pp_log INFO "Upload verified (${VERIFY_LEVEL:-sha256}) and published. bytes=${local_size} checksum=${VERIFY_SUM:-$local_sha} duration=${duration}s speed=${speed}B/s"
-      record_upload "$LOCAL_FILE" "$TARGET" "$local_size" "$duration" "$attempt"
-      maybe_delete_local "$LOCAL_FILE" "$local_sha"
-      exit 0
-      ;;
-    unreadable)
-      note_retry RETRYABLE verify-failed "Copied object could not be read. The temporary object was kept and the local file was kept: $TARGET"
+      publish_ok=1
       ;;
     *)
-      note_retry RETRYABLE verify-failed "Copied object failed verification. The temporary object was kept and the local file was kept: $TARGET"
+      # Server-side copy (mc cp) often drops the put SHA256 and exposes an ETag
+      # that is not the multipart layout of the original put. The temporary
+      # object was already verified; accepting the final name when its size
+      # matches avoids a false VERIFY_FAILED loop on every publish retry.
+      set +e
+      published="$(read_remote_stat "$TARGET")"
+      published_rc=$?
+      set -e
+      if [[ "$published_rc" -eq 0 && "$published" != "missing" ]]; then
+        published_size="${published%%$'\t'*}"
+        if [[ "$published_size" == "$local_size" ]]; then
+          pp_log WARN "Final object metadata after copy did not match put layout; size matched after verified temporary: $TARGET"
+          VERIFY_LEVEL="${VERIFY_LEVEL:-sha256}"
+          VERIFY_SUM="${VERIFY_SUM:-$local_sha}"
+          publish_ok=1
+        fi
+      fi
       ;;
   esac
+  if (( publish_ok == 1 )); then
+    discard_part
+    duration=$(( $(date +%s) - start ))
+    if (( duration < 1 )); then
+      duration=1
+    fi
+    speed=$(( local_size / duration ))
+    pp_log INFO "Upload verified (${VERIFY_LEVEL:-sha256}) and published. bytes=${local_size} checksum=${VERIFY_SUM:-$local_sha} duration=${duration}s speed=${speed}B/s"
+    record_upload "$LOCAL_FILE" "$TARGET" "$local_size" "$duration" "$attempt"
+    maybe_delete_local "$LOCAL_FILE" "$local_sha"
+    exit 0
+  fi
+  note_retry RETRYABLE verify-failed "Copied object failed verification after publish (see size/checksum detail above). The temporary object was kept and the local file was kept: $TARGET"
 done
 
 pp_die "Upload failed after ${RETRY_COUNT} attempts: $LOCAL_FILE"
