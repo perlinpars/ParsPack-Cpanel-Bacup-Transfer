@@ -181,10 +181,24 @@ if [[ "${1:-}" == "--complete" ]]; then
     names_rc=$?
     set -e
     if [[ "$names_rc" -ne 0 || -z "$names" ]]; then
-      pp_log ERROR "no local accounts and no verified account rows in state for $day_name; marker kept"
-      exit 1
+      # Fallback: idle/complete gate from DB when local tars are already gone.
+      now="$(date +%s)"
+      set +e
+      day_gate="$(pp_state accounts-day-gate --date "$day_name" --idle 0 --now "$now" --deadline "$((now + 10))")"
+      day_rc=$?
+      set -e
+      day_status="${day_gate%%$'\t'*}"
+      day_names="${day_gate#*$'\t'}"
+      if [[ "$day_rc" -eq 0 && "$day_status" == "ready" && -n "$day_names" ]]; then
+        names="$day_names"
+        pp_log INFO "using accounts-day-gate names from state for finalize ($day_name)"
+      else
+        pp_log ERROR "no local accounts and no verified account rows in state for $day_name; marker kept"
+        exit 1
+      fi
+    else
+      pp_log INFO "using verified account names from state for finalize ($day_name)"
     fi
-    pp_log INFO "using verified account names from state for finalize ($day_name)"
   fi
   now="$(date +%s)"
   set +e
@@ -347,8 +361,13 @@ if (( sent + skipped == 0 )); then
   system_ok=0
   if (( complete_mode == 1 )); then
     set +e
-    system_ok="$(pp_state system-success-count --date "$day_name")"
+    _sys_count="$(pp_state system-success-count --date "$day_name")"
+    _sys_rc=$?
     set -e
+    system_ok="$(printf '%s' "$_sys_count" | tr -cd '0-9')"
+    if [[ "$_sys_rc" -ne 0 || -z "$system_ok" ]]; then
+      system_ok=0
+    fi
   fi
   if (( complete_mode == 1 && system_ok > 0 )); then
     pp_log INFO "local system empty; $system_ok system file(s) already verified in state for $day_name"

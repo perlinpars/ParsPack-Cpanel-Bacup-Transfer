@@ -21,7 +21,7 @@ Exit status for this plugin:
 | Status | Meaning | STDERR |
 | --- | --- | --- |
 | 0 | The transport command succeeded. A backup `put` in `MODE=TEST` does not use 0. The WHM validation probe does. | |
-| 1 | A path was refused (traversal, symlink, empty file, hard link, illegal remote name) or the operation failed. | `config error: ...` for a path refusal, or the engine log line for an operation failure |
+| 1 | A path was refused (traversal, symlink, empty file, illegal remote name) or the operation failed. | `config error: ...` for a path refusal, or the engine log line for an operation failure |
 | 2 | The configuration is invalid: bad `MODE`, endpoint, prefix, permissions, or helper usage. `doctor` uses this status. | `config error: ...` |
 | 3 | `put` of a backup while `MODE=TEST`. Nothing was uploaded. The WHM validation file is not this case. | An info line that the bucket was checked and nothing was stored |
 

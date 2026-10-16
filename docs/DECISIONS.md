@@ -15,7 +15,7 @@ There is no `describe` or `validate` command in the official command list. WHMâ€
 
 ## Phase 1
 
-Path checks resolve the local file, reject a symlink, a second hard link, a non-regular file, and an empty file, then open that path with `O_NOFOLLOW` and compare the opened inode with a later `lstat`. `mc` still opens the path by name for the upload, so a replacement between the check and `mc` is outside this process. The local delete still unlinks by path after the inode check.
+Path checks resolve the local file, reject a symlink, a non-regular file, and an empty file, then open that path with `O_NOFOLLOW` and compare the opened inode with a later `lstat`. Extra hard links are allowed for reads only after the file is confirmed inside a trusted `LOCAL_READ_ROOTS` tree (cPanel often hard-links account/system archives). Symlinks stay refused. `mc` still opens the path by name for the upload, so a replacement between the check and `mc` is outside this process. The local delete still unlinks by path after the inode check (one directory entry; other hard links are left alone).
 
 A remote 403, invalid key, missing bucket, invalid path, or permission error stops on the first attempt. Other transport errors, including timeout, connection reset, HTTP 429, and HTTP 5xx, use the existing attempt limit. The delay is `RETRY_DELAY_SECONDS` doubled after each failure, plus a small jitter, and it does not exceed `RETRY_DELAY_CAP_SECONDS` (default 300). A base of 0 stays 0, which is what the offline tests use. An old config that omits the cap uses 300.
 

@@ -746,7 +746,7 @@ def accounts_waiting(conn, day, names):
     for name in names:
         row = conn.execute(
             "SELECT status FROM uploads WHERE backup_date = ? AND account = ? "
-            "AND remote_key LIKE '%/accounts/%' ORDER BY id DESC LIMIT 1",
+            "ORDER BY id DESC LIMIT 1",
             (day, name),
         ).fetchone()
         if row is None or row["status"] not in TERMINAL_STATUSES:
@@ -758,26 +758,35 @@ def verified_account_names(conn, day):
     """Account basenames already terminal-success for this day (local tars may be gone)."""
     if not DATE_RE.fullmatch(day) and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         raise StateError("backup date is invalid")
+    # account='system' marks system-tree rows. Everything else with a success
+    # status is an account archive (cPanel user basename).
     rows = conn.execute(
         "SELECT DISTINCT account FROM uploads WHERE backup_date = ? "
         "AND account != '' AND account != 'system' "
-        "AND remote_key LIKE '%/accounts/%' "
         "AND status IN (%s) ORDER BY account"
         % ",".join("?" for _ in SUCCESS_STATUSES),
         (day,) + SUCCESS_STATUSES,
     ).fetchall()
-    return [row["account"] for row in rows]
+    names = []
+    for row in rows:
+        name = (row["account"] or "").strip()
+        if not name or name == "system" or "/" in name or name.startswith("."):
+            continue
+        names.append(name)
+    return names
 
 
 def system_success_count(conn, day):
     """How many system-tree rows are already verified for this day."""
     if not DATE_RE.fullmatch(day) and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         raise StateError("backup date is invalid")
+    # Build IN placeholders by concat — never %-format a string that contains
+    # LIKE '%/system/%' (Python treats %/s as an invalid conversion → ValueError).
+    placeholders = ",".join("?" for _ in SUCCESS_STATUSES)
     return int(conn.execute(
         "SELECT COUNT(*) FROM uploads WHERE backup_date = ? "
         "AND (account = 'system' OR remote_key LIKE '%/system/%') "
-        "AND status IN (%s)"
-        % ",".join("?" for _ in SUCCESS_STATUSES),
+        "AND status IN (" + placeholders + ")",
         (day,) + SUCCESS_STATUSES,
     ).fetchone()[0])
 
@@ -805,8 +814,7 @@ def accounts_day_gate(conn, day, idle_seconds, now, deadline):
     idle_seconds = max(0, int(idle_seconds))
     rows = list(conn.execute(
         "SELECT account, status, updated_at FROM uploads WHERE backup_date = ? "
-        "AND account != '' AND account != 'system' "
-        "AND remote_key LIKE '%/accounts/%'",
+        "AND account != '' AND account != 'system'",
         (day,),
     ))
     if not rows:
@@ -814,7 +822,12 @@ def accounts_day_gate(conn, day, idle_seconds, now, deadline):
     if any(row["status"] not in TERMINAL_STATUSES for row in rows):
         return ("partial" if now >= deadline else "waiting"), []
     success = sorted({
-        row["account"] for row in rows if row["status"] in SUCCESS_STATUSES
+        (row["account"] or "").strip()
+        for row in rows
+        if row["status"] in SUCCESS_STATUSES
+        and (row["account"] or "").strip()
+        and (row["account"] or "").strip() != "system"
+        and "/" not in (row["account"] or "")
     })
     if not success:
         return ("partial" if now >= deadline else "waiting"), []

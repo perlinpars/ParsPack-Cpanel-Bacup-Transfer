@@ -1188,8 +1188,6 @@ def check_local(kind, path, conf, cwd=None):
         info = os.lstat(real)
         if info.st_uid != 0:
             raise ConfigError("local file must be owned by root")
-        if info.st_nlink != 1:
-            raise ConfigError("local file must not be a hard link")
         if info.st_size <= 0:
             raise ConfigError("local file is empty")
         if is_sensitive_path(real):
@@ -1198,6 +1196,9 @@ def check_local(kind, path, conf, cwd=None):
         if root is None:
             raise ConfigError("local file is outside the allowed root-owned directories")
         assert_directory_chain(os.path.dirname(real), root)
+        # cPanel may hard-link account/system archives under the backup roots.
+        # Allow extra links only after the path is already inside a trusted
+        # root-owned tree. Symlinks remain refused above.
         # Open the path we already resolved. mc later opens that same path
         # again; this inode check only covers the check itself.
         fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -1206,8 +1207,10 @@ def check_local(kind, path, conf, cwd=None):
             again = os.lstat(real)
             if (opened.st_dev, opened.st_ino) != (again.st_dev, again.st_ino):
                 raise ConfigError("local file changed while it was being checked")
-            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size <= 0:
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size <= 0:
                 raise ConfigError("local file is not a regular file")
+            if opened.st_uid != 0:
+                raise ConfigError("local file must be owned by root")
         finally:
             os.close(fd)
         return real
